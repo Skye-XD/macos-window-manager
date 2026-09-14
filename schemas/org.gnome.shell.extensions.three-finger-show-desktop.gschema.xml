@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <enum id="org.gnome.shell.extensions.three-finger-show-desktop.easing">
+    <value nick="ease-out-cubic" value="0"/>
+    <value nick="ease-out-quad" value="1"/>
+    <value nick="ease-out-expo" value="2"/>
+    <value nick="ease-out-back" value="3"/>
+    <value nick="ease-in-out-cubic" value="4"/>
+  </enum>
+  <schema id="org.gnome.shell.extensions.three-finger-show-desktop"
+          path="/org/gnome/shell/extensions/three-finger-show-desktop/">
+    <key name="peek-px" type="i">
+      <default>10</default>
+      <range min="0" max="400"/>
+      <summary>Sliver left on screen</summary>
+      <description>How much of a parked window stays visible at the screen edge. 0 pushes it fully out of sight.</description>
+    </key>
+    <key name="animation-duration" type="i">
+      <default>300</default>
+      <range min="0" max="2000"/>
+      <summary>Animation length in milliseconds</summary>
+      <description>How long windows take to leave for the edge and to come back.</description>
+    </key>
+    <key name="easing" enum="org.gnome.shell.extensions.three-finger-show-desktop.easing">
+      <default>'ease-out-cubic'</default>
+      <summary>Animation curve</summary>
+      <description>The easing curve windows follow on their way to the edge and back.</description>
+    </key>
+    <key name="pinch-show-scale" type="d">
+      <default>1.25</default>
+      <range min="1.01" max="3.0"/>
+      <summary>Spread threshold</summary>
+      <description>How far a four-finger spread must open before the desktop is shown.</description>
+    </key>
+    <key name="pinch-restore-scale" type="d">
+      <default>0.8</default>
+      <range min="0.1" max="0.99"/>
+      <summary>Pinch threshold</summary>
+      <description>How far a four-finger pinch must close before the windows come back.</description>
+    </key>
+  </schema>
+</schemalist>

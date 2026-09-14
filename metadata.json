@@ -1,7 +1,10 @@
 {
   "uuid": "three-finger-show-desktop@theDavidCoen.github.io",
   "name": "Three Finger Show Desktop",
-  "description": "Adds a touchpad gesture that GNOME does not provide: show the desktop with a 3-finger swipe down on the normal desktop (Wayland, GNOME 50).\n\n* Swipe down slowly: windows animate toward the screen edge in sync with your fingers; release early to cancel\n* Swipe down fully: show the desktop; swipe down again to restore\n* Swipe up is unchanged: only downward 3-finger swipes are captured; Overview and the app grid still use the stock up gesture\n* No panel icon and no Quick Settings entry",
-  "shell-version": ["50"],
-  "url": "https://github.com/theDavidCoen/three-finger-show-desktop"
+  "description": "Show the desktop the way macOS does: every window slides off the screen edge it sits nearest, at full size, leaving the desktop bare and usable. Four-finger spread shows it, four-finger pinch brings the windows back, and a click on empty desktop toggles it when the desktop-icons fork is emitting desktopclick. The original three-finger swipe down still works.",
+  "shell-version": [
+    "50"
+  ],
+  "url": "https://github.com/theDavidCoen/three-finger-show-desktop",
+  "settings-schema": "org.gnome.shell.extensions.three-finger-show-desktop"
 }
