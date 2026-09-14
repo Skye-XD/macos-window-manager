@@ -1,6 +1,6 @@
 {
-  "uuid": "three-finger-show-desktop@theDavidCoen.github.io",
-  "name": "Three Finger Show Desktop",
+  "uuid": "macos-window-manager@skye-xd.github.io",
+  "name": "macOS Window Manager",
   "description": "Show the desktop the way macOS does: every window slides off the screen edge it sits nearest, at full size, leaving the desktop bare and usable. Four-finger spread shows it, four-finger pinch brings the windows back, and a click on empty desktop toggles it when the desktop-icons fork is emitting desktopclick. The original three-finger swipe down still works.",
   "shell-version": [
     "50"
