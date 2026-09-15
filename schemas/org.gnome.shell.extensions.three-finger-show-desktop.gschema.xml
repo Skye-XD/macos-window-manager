@@ -29,14 +29,20 @@
     <key name="pinch-show-scale" type="d">
       <default>1.25</default>
       <range min="1.01" max="3.0"/>
-      <summary>Spread threshold</summary>
-      <description>How far a four-finger spread must open before the desktop is shown.</description>
+      <summary>Spread travel</summary>
+      <description>How far a four-finger spread opens between the windows sitting at home and being fully parked. Larger means the same finger movement moves the windows less.</description>
     </key>
     <key name="pinch-restore-scale" type="d">
       <default>0.8</default>
       <range min="0.1" max="0.99"/>
-      <summary>Pinch threshold</summary>
-      <description>How far a four-finger pinch must close before the windows come back.</description>
+      <summary>Pinch travel</summary>
+      <description>How far a four-finger pinch closes between the windows being parked and back at home. Smaller means the same finger movement moves the windows less.</description>
+    </key>
+    <key name="pinch-commit-progress" type="d">
+      <default>0.5</default>
+      <range min="0.05" max="0.95"/>
+      <summary>How far to travel before letting go finishes the gesture</summary>
+      <description>The fraction of the spread or pinch that has to be covered for releasing the fingers to complete it rather than put the windows back. Deliberately separate from the travel keys, so the motion can be slowed without also making it harder to commit to. Lower commits sooner.</description>
     </key>
     <key name="mission-control-toggle" type="as">
       <default><![CDATA[['<Control><Super>Up']]]></default>

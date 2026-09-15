@@ -63,6 +63,10 @@ class Tunables {
         return this._settings.get_double('pinch-restore-scale');
     }
 
+    get commitProgress() {
+        return this._settings.get_double('pinch-commit-progress');
+    }
+
     get gridPadding() {
         return this._settings.get_int('grid-padding-px');
     }
@@ -82,6 +86,11 @@ const CLOSE_FALLBACK_US = 400000;
 // These arrive as TOUCHPAD_PINCH events carrying an absolute scale, which is
 // why a SwipeTracker cannot express them.
 const PINCH_FINGER_COUNT = 4;
+
+// How far the scale has to leave 1 before the gesture is claimed. Four fingers
+// resting on the pad report a scale of 1 and jitter either side of it, and
+// claiming there would swallow pinches meant for somebody else.
+const PINCH_DEADZONE = 0.02;
 
 // Window types worth spreading. An allow list rather than a deny list, so a
 // type nobody thought about is left alone instead of being flung off screen.
@@ -283,14 +292,25 @@ const TouchpadSwipeDownOnly = GObject.registerClass(
 /**
  * Four-finger pinch and spread. Clutter reports these with an absolute scale
  * rather than a motion delta, so there is no distance to accumulate: the scale
- * is the whole state. Fires once per gesture, when the scale crosses a
- * threshold, and swallows the rest of that gesture.
+ * is the whole state.
+ *
+ * It reports that scale and nothing more. Whether a gesture means "park" or
+ * "restore" depends on what is on screen when it starts, which only
+ * ShowDesktopGesture knows, so the mapping from scale to progress lives there.
+ *
+ * `begin` is emitted when the scale first leaves the deadzone rather than on
+ * the gesture's own BEGIN phase, since nothing is known about direction until
+ * the fingers move. A handler that cannot use the gesture calls `cancel()`
+ * from inside `begin` -- signal emission is synchronous, so that decision is
+ * settled before the event is disposed of -- and the rest of the gesture is
+ * then propagated untouched.
  */
 const TouchpadPinch = GObject.registerClass(
     {
         Signals: {
-            spread: {},
-            pinch: {},
+            begin: {param_types: [GObject.TYPE_DOUBLE]},
+            update: {param_types: [GObject.TYPE_DOUBLE]},
+            end: {param_types: [GObject.TYPE_DOUBLE]},
         },
     },
     class TouchpadPinch extends GObject.Object {
@@ -298,7 +318,8 @@ const TouchpadPinch = GObject.registerClass(
             super();
             this._tunables = tunables;
             this.enabled = true;
-            this._fired = false;
+            this._state = TouchpadState.NONE;
+            this._scale = 1;
 
             this._stageHandler = global.stage.connect(
                 'captured-event::touchpad',
@@ -313,40 +334,62 @@ const TouchpadPinch = GObject.registerClass(
             }
         }
 
+        /**
+         * Decline the gesture being offered. Only meaningful from a `begin`
+         * handler.
+         */
+        cancel() {
+            this._state = TouchpadState.IGNORED;
+        }
+
         _onEvent(_actor, event) {
             if (event.type() !== Clutter.EventType.TOUCHPAD_PINCH)
-                return Clutter.EVENT_PROPAGATE;
-
-            if (!this.enabled)
-                return Clutter.EVENT_PROPAGATE;
-
-            if (event.get_touchpad_gesture_finger_count() !== PINCH_FINGER_COUNT)
                 return Clutter.EVENT_PROPAGATE;
 
             const phase = event.get_gesture_phase();
 
             if (phase === Clutter.TouchpadGesturePhase.BEGIN) {
-                this._fired = false;
+                this._state = TouchpadState.NONE;
+                this._scale = 1;
+            }
+
+            if (this._state === TouchpadState.IGNORED)
+                return Clutter.EVENT_PROPAGATE;
+
+            if (!this.enabled)
+                return Clutter.EVENT_PROPAGATE;
+
+            if (event.get_touchpad_gesture_finger_count() !== PINCH_FINGER_COUNT) {
+                this._state = TouchpadState.IGNORED;
                 return Clutter.EVENT_PROPAGATE;
             }
 
-            if (phase !== Clutter.TouchpadGesturePhase.UPDATE)
-                return Clutter.EVENT_PROPAGATE;
+            if (phase === Clutter.TouchpadGesturePhase.UPDATE) {
+                this._scale = event.get_gesture_pinch_scale();
 
-            if (this._fired)
-                return Clutter.EVENT_STOP;
+                if (this._state === TouchpadState.NONE) {
+                    if (Math.abs(this._scale - 1) < PINCH_DEADZONE)
+                        return Clutter.EVENT_PROPAGATE;
 
-            const scale = event.get_gesture_pinch_scale();
+                    this._state = TouchpadState.HANDLING;
+                    this.emit('begin', this._scale);
+                    if (this._state !== TouchpadState.HANDLING)
+                        return Clutter.EVENT_PROPAGATE;
+                }
 
-            if (scale >= this._tunables.showScale) {
-                this._fired = true;
-                this.emit('spread');
+                this.emit('update', this._scale);
                 return Clutter.EVENT_STOP;
             }
 
-            if (scale <= this._tunables.restoreScale) {
-                this._fired = true;
-                this.emit('pinch');
+            if (
+                phase === Clutter.TouchpadGesturePhase.END ||
+                phase === Clutter.TouchpadGesturePhase.CANCEL
+            ) {
+                if (this._state !== TouchpadState.HANDLING)
+                    return Clutter.EVENT_PROPAGATE;
+
+                this._state = TouchpadState.NONE;
+                this.emit('end', this._scale);
                 return Clutter.EVENT_STOP;
             }
 
@@ -639,12 +682,33 @@ class MonitorGroup {
      * @returns {boolean} whether anything was parked
      */
     unpark(duration) {
+        if (!this.resume())
+            return false;
+
+        this.end(0, duration, DesktopState.NORMAL);
+        return true;
+    }
+
+    /**
+     * Make the parked clones live again, so update() drives them. The caller
+     * owns them from there and must reach end(), which either hands the screen
+     * back to the real windows or parks them again.
+     *
+     * @returns {boolean} whether anything was parked
+     */
+    resume() {
         if (this._parked.length === 0)
             return false;
 
         this._entries = this._parked;
         this._parked = [];
-        this.end(0, duration, DesktopState.NORMAL);
+        // The park animation may still be running. Taking the clones over
+        // means driving them by hand from here, and update() refuses while a
+        // finish is in flight. Dropping the transitions runs each onStopped,
+        // which is why _finishing is zeroed after rather than before.
+        for (const {clone} of this._entries)
+            clone.remove_all_transitions();
+        this._finishing = 0;
         return true;
     }
 
@@ -726,6 +790,11 @@ class ShowDesktopGesture {
         this._displayHandlers = [];
         this._wmHandlers = [];
         this._gestureActive = false;
+        // 'park' or 'restore' while a pinch is in flight. Settled once at the
+        // start of the gesture rather than re-read per frame, so releasing
+        // does the opposite of what the gesture was doing whatever the windows
+        // happen to be in the middle of.
+        this._gestureDirection = null;
         this._restoreSwipeDown = 0;
         this._restoreHandlers = [];
         this._swipeDistance = primarySwipeDistance();
@@ -756,8 +825,9 @@ class ShowDesktopGesture {
 
         this._pinch = new TouchpadPinch(this._tunables);
         this._pinchHandlers = [
-            this._pinch.connect('spread', () => this.showDesktop()),
-            this._pinch.connect('pinch', () => this.restoreDesktop()),
+            this._pinch.connect('begin', this._onPinchBegin.bind(this)),
+            this._pinch.connect('update', this._onPinchUpdate.bind(this)),
+            this._pinch.connect('end', this._onPinchEnd.bind(this)),
         ];
 
         // DING draws over the shell's background actor, so a click on empty
@@ -897,6 +967,7 @@ class ShowDesktopGesture {
             return;
 
         this._gestureActive = false;
+        this._gestureDirection = null;
         if (animate) {
             for (const group of this._monitorGroups)
                 group.end(DesktopState.NORMAL, MIN_FINISH_DURATION_MS);
@@ -904,7 +975,10 @@ class ShowDesktopGesture {
             for (const group of this._monitorGroups)
                 group.abort();
         }
-        this._minimizingWindows = [];
+        // A cancelled pinch may have been dragging parked windows home, so the
+        // desktop is no longer being shown -- the swipe never starts while it
+        // is, which is why this used to be just the window list.
+        this._settleAfterGesture(DesktopState.NORMAL);
     }
 
     _onTouchpadEndForRestore() {
@@ -975,16 +1049,172 @@ class ShowDesktopGesture {
         }
 
         this._gestureActive = false;
+        this._gestureDirection = null;
         const target =
             endProgress >= 0.5 ? DesktopState.SHOW_DESKTOP : DesktopState.NORMAL;
 
         for (const group of this._monitorGroups)
             group.end(target, duration);
 
-        if (target === DesktopState.SHOW_DESKTOP)
-            this._showingDesktop = true;
+        this._settleAfterGesture(target);
+    }
+
+    /**
+     * A pinch means "park" or "restore" depending on what is on screen when it
+     * starts. Both directions run the same begin/update/end path the swipe
+     * uses, so the only thing decided here is which way round it goes and
+     * where the clones come from.
+     */
+    _onPinchBegin(_pinch, scale) {
+        if (this._gestureActive || !isDesktopMode()) {
+            this._pinch.cancel();
+            return;
+        }
+
+        // Which way the fingers went decides whether there is anything to do,
+        // before any clone is made: spreading parks, pinching restores, and
+        // the opposite of whatever is on screen is not a gesture at all.
+        // Without this an inward pinch on a bare desktop would clone every
+        // window and hide the originals only to reveal them again at rest.
+        if (this._showingDesktop !== (scale < 1)) {
+            this._pinch.cancel();
+            return;
+        }
+
+        if (this._showingDesktop) {
+            let any = false;
+            for (const group of this._monitorGroups) {
+                if (group.resume())
+                    any = true;
+            }
+
+            // Showing the desktop with nothing parked means an older path
+            // minimized the windows, or a monitor change threw the clones
+            // away. There is nothing to drag.
+            if (!any) {
+                this._pinch.cancel();
+                return;
+            }
+
+            this._gestureDirection = 'restore';
+            this._gestureActive = true;
+            return;
+        }
+
+        const wins = this._collectWindows();
+        const groups = this._groupActorsByMonitor(wins);
+        if (groups.length === 0) {
+            this._pinch.cancel();
+            return;
+        }
+
+        this._minimizingWindows = wins;
+        for (const {group, actors} of groups) {
+            group.setLayout('edge');
+            group.begin(actors);
+        }
+
+        this._gestureDirection = 'park';
+        this._gestureActive = true;
+    }
+
+    /**
+     * Scale to progress, where 0 is home and 1 is parked. Spreading runs from
+     * 1 to showScale and pinching from 1 to restoreScale, so each direction is
+     * normalised against its own tunable and the gesture completes exactly
+     * where the old threshold used to fire. Both keys keep their meaning:
+     * "how far the fingers travel", rather than "where it triggers".
+     *
+     * @param {number} scale the gesture's absolute scale
+     * @returns {number} progress in 0..1
+     */
+    _pinchProgress(scale) {
+        if (this._gestureDirection === 'restore') {
+            const span = 1 - this._tunables.restoreScale;
+            return span > 0 ? clamp(1 - (1 - scale) / span, 0, 1) : 1;
+        }
+
+        const span = this._tunables.showScale - 1;
+        return span > 0 ? clamp((scale - 1) / span, 0, 1) : 1;
+    }
+
+    /**
+     * How far the gesture has come from where it started, so one rule covers
+     * both directions: parking counts up from 0, restoring counts down from 1.
+     *
+     * @param {number} progress 0 for home, 1 for parked
+     * @returns {number} distance travelled, in 0..1
+     */
+    _travelled(progress) {
+        return this._gestureDirection === 'restore' ? 1 - progress : progress;
+    }
+
+    _onPinchUpdate(_pinch, scale) {
+        if (!this._gestureActive)
+            return;
+
+        const p = this._pinchProgress(scale);
+        for (const group of this._monitorGroups)
+            group.update(p);
+    }
+
+    _onPinchEnd(_pinch, scale) {
+        if (!this._gestureActive)
+            return;
+
+        const parking = this._gestureDirection !== 'restore';
+        const progress = this._pinchProgress(scale);
+        const travelled = this._travelled(progress);
+        // Not the midpoint, and deliberately not read off the travel keys:
+        // widening those to slow the motion down was also moving the point of
+        // no return further away, so a comfortable spread stopped completing.
+        const committed = travelled >= this._tunables.commitProgress;
+
+        let target;
+        if (parking)
+            target = committed ? DesktopState.SHOW_DESKTOP : DesktopState.NORMAL;
         else
-            this._minimizingWindows = [];
+            target = committed ? DesktopState.NORMAL : DesktopState.SHOW_DESKTOP;
+        // Only the distance still to travel is animated, so letting go a hair
+        // from either end takes the minimum finish rather than the full
+        // duration. _finishEntry floors it at MIN_FINISH_DURATION_MS.
+        const dur = Math.round(
+            this._tunables.duration * Math.abs(target - progress));
+
+        this._gestureActive = false;
+        this._gestureDirection = null;
+
+        for (const group of this._monitorGroups)
+            group.end(target, dur);
+
+        this._settleAfterGesture(target);
+    }
+
+    /**
+     * Bring the bookkeeping in line with where a gesture actually ended.
+     * Shared by the swipe, the pinch and a gesture cancelled in flight, since
+     * all three can finish on either side.
+     *
+     * @param {number} target the DesktopState the groups were sent to
+     */
+    _settleAfterGesture(target) {
+        if (target === DesktopState.SHOW_DESKTOP) {
+            this._showingDesktop = true;
+            // Left alone if a mode is already set: a pinch that starts on a
+            // Mission Control spread and is released short of home re-parks
+            // into the grid, and is still Mission Control.
+            this._mode ??= 'desktop';
+            this._parkedAt = GLib.get_monotonic_time();
+            return;
+        }
+
+        this._showingDesktop = false;
+        // Every dismissal leaves the groups in the parking layout, as
+        // restoreDesktop does, so the next gesture is not laid out as a grid.
+        this._mode = null;
+        for (const group of this._monitorGroups)
+            group.setLayout('edge');
+        this._minimizingWindows = [];
     }
 
     _groupActorsByMonitor(wins) {
