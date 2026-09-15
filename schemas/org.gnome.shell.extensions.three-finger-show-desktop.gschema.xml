@@ -26,6 +26,12 @@
       <summary>Animation curve</summary>
       <description>The easing curve windows follow on their way to the edge and back.</description>
     </key>
+    <key name="swipe-finger-count" type="i">
+      <default>3</default>
+      <range min="3" max="5"/>
+      <summary>Fingers on the pad for the vertical swipe</summary>
+      <description>How many fingers the show-desktop swipe wants. GNOME's own overview gesture answers to any swipe of three or more, so raising this to 4 moves out of its way. macOS puts its navigation gestures on four fingers and leaves three free.</description>
+    </key>
     <key name="pinch-show-scale" type="d">
       <default>1.25</default>
       <range min="1.01" max="3.0"/>

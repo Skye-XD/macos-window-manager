@@ -14,7 +14,6 @@ import {SwipeTracker} from 'resource:///org/gnome/shell/ui/swipeTracker.js';
 import {lerp} from 'resource:///org/gnome/shell/misc/util.js';
 import {MonitorConstraint} from 'resource:///org/gnome/shell/ui/layout.js';
 
-const FINGER_COUNT = 3;
 const DRAG_THRESHOLD_PX = 16;
 const ACTIVATION_DOWN_PX = 80;
 const CANCEL_PROGRESS = 0.15;
@@ -61,6 +60,10 @@ class Tunables {
 
     get restoreScale() {
         return this._settings.get_double('pinch-restore-scale');
+    }
+
+    get swipeFingers() {
+        return this._settings.get_int('swipe-finger-count');
     }
 
     get commitProgress() {
@@ -136,9 +139,14 @@ function progressToUnit(progress) {
 }
 
 /**
- * Vertical touchpad swipe — only finger motion toward the bottom of the pad.
+ * Vertical touchpad swipe, in one direction. Progress runs 0 to 1 whichever
+ * way the gesture goes, so the SwipeTracker downstream needs no notion of
+ * direction and an upward swipe is just a sign flip.
+ *
+ * The finger count is read from settings at the moment a gesture is
+ * classified, not cached, so changing it takes effect without a logout.
  */
-const TouchpadSwipeDownOnly = GObject.registerClass(
+const TouchpadVerticalSwipe = GObject.registerClass(
     {
         Signals: {
             begin: {
@@ -158,10 +166,11 @@ const TouchpadSwipeDownOnly = GObject.registerClass(
             end: {param_types: [GObject.TYPE_UINT, GObject.TYPE_DOUBLE]},
         },
     },
-    class TouchpadSwipeDownOnly extends GObject.Object {
-        constructor(allowedModes) {
+    class TouchpadVerticalSwipe extends GObject.Object {
+        constructor(allowedModes, direction, tunables) {
             super();
-            this._nfingers = [FINGER_COUNT];
+            this._direction = direction;
+            this._tunables = tunables;
             this._allowedModes = allowedModes;
             this._swipeDistance = primarySwipeDistance();
             this._state = TouchpadState.NONE;
@@ -191,8 +200,10 @@ const TouchpadSwipeDownOnly = GObject.registerClass(
         }
 
         _motionDelta(dy) {
-            // Signed delta: down on pad increases progress, reversing up decreases it.
-            return dy * SWIPE_MULTIPLIER;
+            // Signed delta: motion in this gesture's own direction increases
+            // progress, reversing decreases it.
+            const sign = this._direction === 'up' ? -1 : 1;
+            return dy * sign * SWIPE_MULTIPLIER;
         }
 
         _onEvent(_actor, event) {
@@ -218,7 +229,7 @@ const TouchpadSwipeDownOnly = GObject.registerClass(
                 return Clutter.EVENT_PROPAGATE;
             }
 
-            if (!this._nfingers.includes(event.get_touchpad_gesture_finger_count())) {
+            if (event.get_touchpad_gesture_finger_count() !== this._tunables.swipeFingers) {
                 this._state = TouchpadState.IGNORED;
                 return Clutter.EVENT_PROPAGATE;
             }
@@ -250,8 +261,10 @@ const TouchpadSwipeDownOnly = GObject.registerClass(
                     return Clutter.EVENT_PROPAGATE;
                 }
 
-                // Start only on downward intent; upward-only swipes go to Overview.
-                if (cdy <= 0) {
+                // Start only on intent in this gesture's direction, so the
+                // opposite swipe falls through to whoever else wants it.
+                const wanted = this._direction === 'up' ? cdy < 0 : cdy > 0;
+                if (!wanted) {
                     this._state = TouchpadState.IGNORED;
                     return Clutter.EVENT_PROPAGATE;
                 }
@@ -398,7 +411,7 @@ const TouchpadPinch = GObject.registerClass(
     },
 );
 
-function createDownSwipeTracker(allowedModes) {
+function createSwipeTracker(allowedModes, direction, tunables) {
     const swipeTracker = new SwipeTracker(
         global.stage,
         Clutter.Orientation.VERTICAL,
@@ -411,7 +424,7 @@ function createDownSwipeTracker(allowedModes) {
     if (swipeTracker._touchpadGesture)
         swipeTracker._touchpadGesture.destroy();
 
-    const touchpad = new TouchpadSwipeDownOnly(allowedModes);
+    const touchpad = new TouchpadVerticalSwipe(allowedModes, direction, tunables);
     swipeTracker._touchpadGesture = touchpad;
 
     touchpad.connect('begin', swipeTracker._beginTouchpadGesture.bind(swipeTracker));
@@ -799,7 +812,8 @@ class ShowDesktopGesture {
         this._restoreHandlers = [];
         this._swipeDistance = primarySwipeDistance();
 
-        this._swipeTracker = createDownSwipeTracker(Shell.ActionMode.NORMAL);
+        this._swipeTracker = createSwipeTracker(
+            Shell.ActionMode.NORMAL, 'down', this._tunables);
         this._touchpad = this._swipeTracker._touchpadGesture;
 
         this._handlers = [
@@ -1002,12 +1016,6 @@ class ShowDesktopGesture {
             return;
         }
 
-        this._minimizingWindows = this._collectWindows();
-        if (this._minimizingWindows.length === 0) {
-            this._gestureActive = false;
-            return;
-        }
-
         this._swipeDistance = primarySwipeDistance();
         this._touchpad.setSwipeDistance(this._swipeDistance);
 
@@ -1018,21 +1026,11 @@ class ShowDesktopGesture {
             CANCEL_PROGRESS,
         );
 
-        let any = false;
-        for (const group of this._monitorGroups) {
-            const actors = this._minimizingWindows
-                .map(w => w.get_compositor_private())
-                .filter(a =>
-                    a instanceof Meta.WindowActor &&
-                    a.meta_window?.get_monitor() === group.monitor.index,
-                );
-            if (actors.length > 0) {
-                group.begin(actors);
-                any = true;
-            }
-        }
-
-        if (!any) {
+        if (!this._beginGesture({
+            layout: 'edge',
+            windows: this._collectWindows(),
+            mode: 'desktop',
+        })) {
             this._gestureActive = false;
             this._minimizingWindows = [];
             return;
@@ -1108,17 +1106,13 @@ class ShowDesktopGesture {
             return;
         }
 
-        const wins = this._collectWindows();
-        const groups = this._groupActorsByMonitor(wins);
-        if (groups.length === 0) {
+        if (!this._beginGesture({
+            layout: 'edge',
+            windows: this._collectWindows(),
+            mode: 'desktop',
+        })) {
             this._pinch.cancel();
             return;
-        }
-
-        this._minimizingWindows = wins;
-        for (const {group, actors} of groups) {
-            group.setLayout('edge');
-            group.begin(actors);
         }
 
         this._gestureDirection = 'park';
@@ -1224,6 +1218,36 @@ class ShowDesktopGesture {
         this._minimizingWindows = [];
     }
 
+    /**
+     * Take the windows: group them by monitor, lay the clones out and put them
+     * up. Every entry point -- both swipes, the pinch, and the two
+     * non-interactive toggles -- did exactly this, differing only in which
+     * windows and which layout, so they all come through here now.
+     *
+     * @param {object} opts options
+     * @param {string} opts.layout 'edge' to park at the side, 'grid' to tile
+     * @param {Meta.Window[]} opts.windows the windows to take
+     * @param {string|null} opts.mode mode to record, or null to leave it
+     * @returns {boolean} whether anything was taken
+     */
+    _beginGesture({layout, windows, mode = null}) {
+        if (!windows || windows.length === 0)
+            return false;
+
+        const groups = this._groupActorsByMonitor(windows);
+        if (groups.length === 0)
+            return false;
+
+        this._minimizingWindows = windows;
+        for (const {group, actors} of groups) {
+            group.setLayout(layout);
+            group.begin(actors);
+        }
+        if (mode)
+            this._mode = mode;
+        return true;
+    }
+
     _groupActorsByMonitor(wins) {
         const groups = [];
         for (const group of this._monitorGroups) {
@@ -1243,24 +1267,18 @@ class ShowDesktopGesture {
         if (this._showingDesktop || this._gestureActive || !isDesktopMode())
             return;
 
-        const wins = this._collectWindows();
-        if (wins.length === 0)
-            return;
-
-        const groups = this._groupActorsByMonitor(wins);
-        if (groups.length === 0)
+        if (!this._beginGesture({
+            layout: 'edge',
+            windows: this._collectWindows(),
+            mode: 'desktop',
+        }))
             return;
 
         const dur = duration ?? this._tunables.duration;
-        this._minimizingWindows = wins;
-        for (const {group, actors} of groups) {
-            group.setLayout('edge');
-            group.begin(actors);
+        for (const group of this._monitorGroups)
             group.end(DesktopState.SHOW_DESKTOP, dur);
-        }
-        this._mode = 'desktop';
-        this._showingDesktop = true;
-        this._parkedAt = GLib.get_monotonic_time();
+
+        this._settleAfterGesture(DesktopState.SHOW_DESKTOP);
     }
 
     restoreDesktop(duration = null) {
@@ -1356,24 +1374,18 @@ class ShowDesktopGesture {
         if (this._showingDesktop || this._gestureActive || !isDesktopMode())
             return;
 
-        const wins = this._collectWindows();
-        if (wins.length === 0)
-            return;
-
-        const groups = this._groupActorsByMonitor(wins);
-        if (groups.length === 0)
+        if (!this._beginGesture({
+            layout: 'grid',
+            windows: this._collectWindows(),
+            mode: 'mission',
+        }))
             return;
 
         const dur = duration ?? this._tunables.duration;
-        this._minimizingWindows = wins;
-        for (const {group, actors} of groups) {
-            group.setLayout('grid');
-            group.begin(actors);
+        for (const group of this._monitorGroups)
             group.end(DesktopState.SHOW_DESKTOP, dur);
-        }
-        this._mode = 'mission';
-        this._showingDesktop = true;
-        this._parkedAt = GLib.get_monotonic_time();
+
+        this._settleAfterGesture(DesktopState.SHOW_DESKTOP);
     }
 
     /**
