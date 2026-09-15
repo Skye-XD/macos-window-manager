@@ -49,6 +49,11 @@
       <summary>Show every window</summary>
       <description>Spread the windows of the current workspace out to be picked from, the way Mission Control does. macOS uses Control+Up for this.</description>
     </key>
+    <key name="show-desktop-toggle" type="as">
+      <default><![CDATA[['<Control><Super>Up', '<Super>d']]]></default>
+      <summary>Show the desktop</summary>
+      <description>Park every window at the screen edge, and bring them back when pressed again. The same toggle the gestures and a click on empty desktop use. macOS shows the desktop with Command and the Mission Control key.</description>
+    </key>
     <key name="grid-padding-px" type="i">
       <default>24</default>
       <range min="0" max="200"/>

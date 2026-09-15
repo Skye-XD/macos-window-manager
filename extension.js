@@ -850,6 +850,12 @@ class ShowDesktopGesture {
             Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
             () => this.toggleMissionControl());
 
+        // The same toggle the gestures and DING's desktop click reach, so the
+        // keyboard is one more way in rather than a second code path.
+        Main.wm.addKeybinding('show-desktop-toggle', this._settings,
+            Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this.toggle());
+
         this._stageKeyId = global.stage.connect('captured-event::key', (_actor, event) => {
             if (this._mode !== 'mission' ||
                 event.type() !== Clutter.EventType.KEY_PRESS)
@@ -905,6 +911,7 @@ class ShowDesktopGesture {
     destroy() {
         this.resetShowDesktop();
         Main.wm.removeKeybinding('mission-control-toggle');
+        Main.wm.removeKeybinding('show-desktop-toggle');
         if (this._stageKeyId) {
             global.stage.disconnect(this._stageKeyId);
             this._stageKeyId = 0;
