@@ -7,6 +7,15 @@
     <value nick="ease-out-back" value="3"/>
     <value nick="ease-in-out-cubic" value="4"/>
   </enum>
+  <enum id="org.gnome.shell.extensions.three-finger-show-desktop.swipe-up-action">
+    <value nick="none" value="0"/>
+    <value nick="mission-control" value="1"/>
+  </enum>
+  <enum id="org.gnome.shell.extensions.three-finger-show-desktop.swipe-down-action">
+    <value nick="show-desktop" value="0"/>
+    <value nick="app-expose" value="1"/>
+    <value nick="none" value="2"/>
+  </enum>
   <schema id="org.gnome.shell.extensions.three-finger-show-desktop"
           path="/org/gnome/shell/extensions/three-finger-show-desktop/">
     <key name="peek-px" type="i">
@@ -25,6 +34,31 @@
       <default>'ease-out-cubic'</default>
       <summary>Animation curve</summary>
       <description>The easing curve windows follow on their way to the edge and back.</description>
+    </key>
+    <key name="swipe-up-action" enum="org.gnome.shell.extensions.three-finger-show-desktop.swipe-up-action">
+      <default>'none'</default>
+      <summary>What an upward swipe does</summary>
+      <description>Upstream has no upward gesture and leaves the swipe to GNOME's overview. 'mission-control' spreads the workspace's windows out to be picked from instead. macOS opens Mission Control by swiping up with four fingers.</description>
+    </key>
+    <key name="swipe-down-action" enum="org.gnome.shell.extensions.three-finger-show-desktop.swipe-down-action">
+      <default>'show-desktop'</default>
+      <summary>What a downward swipe does</summary>
+      <description>'show-desktop' parks the windows at the screen edge, which is what this extension has always done. 'app-expose' spreads only the focused application's windows, as macOS does when swiping down with four fingers.</description>
+    </key>
+    <key name="pinch-opens-launchpad" type="b">
+      <default>false</default>
+      <summary>Pinching in on a bare desktop opens the app grid</summary>
+      <description>With nothing parked, a four-finger pinch has nothing to bring back. macOS opens Launchpad on that gesture. This asks the overview for its app grid, which a launcher extension replacing the grid will answer instead.</description>
+    </key>
+    <key name="suppress-other-vertical-swipes" type="b">
+      <default>false</default>
+      <summary>Swallow vertical swipes with a different finger count</summary>
+      <description>GNOME's overview answers to any vertical swipe of three or more fingers, so raising swipe-finger-count leaves the lower counts still opening it. This consumes those. Horizontal swipes are never touched, so switching workspaces keeps working.</description>
+    </key>
+    <key name="launcher-extension-uuid" type="s">
+      <default>''</default>
+      <summary>Launcher extension a spread should dismiss</summary>
+      <description>UUID of an extension publishing an isLauncherOpen() method. While it reports itself open, a spread closes it instead of parking the windows behind it -- the gesture macOS dismisses Launchpad with. Empty disables this.</description>
     </key>
     <key name="swipe-finger-count" type="i">
       <default>3</default>

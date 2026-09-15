@@ -13,6 +13,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {SwipeTracker} from 'resource:///org/gnome/shell/ui/swipeTracker.js';
 import {lerp} from 'resource:///org/gnome/shell/misc/util.js';
 import {MonitorConstraint} from 'resource:///org/gnome/shell/ui/layout.js';
+import * as OverviewControls from 'resource:///org/gnome/shell/ui/overviewControls.js';
 
 const DRAG_THRESHOLD_PX = 16;
 const ACTIVATION_DOWN_PX = 80;
@@ -60,6 +61,26 @@ class Tunables {
 
     get restoreScale() {
         return this._settings.get_double('pinch-restore-scale');
+    }
+
+    get launcherUuid() {
+        return this._settings.get_string('launcher-extension-uuid');
+    }
+
+    get swipeUpAction() {
+        return this._settings.get_string('swipe-up-action');
+    }
+
+    get swipeDownAction() {
+        return this._settings.get_string('swipe-down-action');
+    }
+
+    get pinchOpensLaunchpad() {
+        return this._settings.get_boolean('pinch-opens-launchpad');
+    }
+
+    get suppressOtherVerticalSwipes() {
+        return this._settings.get_boolean('suppress-other-vertical-swipes');
     }
 
     get swipeFingers() {
@@ -407,6 +428,82 @@ const TouchpadPinch = GObject.registerClass(
             }
 
             return Clutter.EVENT_PROPAGATE;
+        }
+    },
+);
+
+/**
+ * Swallow vertical swipes that are not ours.
+ *
+ * GNOME's own overview gesture answers to any vertical swipe of three fingers
+ * or more, so once the real gestures move to four, a three-finger flick up
+ * still opens the overview this desktop has otherwise stopped using.
+ *
+ * Horizontal swipes are never touched: those switch workspaces, which is
+ * wanted, and is what macOS does with them too.
+ */
+const TouchpadVerticalSuppressor = GObject.registerClass(
+    class TouchpadVerticalSuppressor extends GObject.Object {
+        constructor(tunables) {
+            super();
+            this._tunables = tunables;
+            this._state = TouchpadState.NONE;
+            this._cumulativeX = 0;
+            this._cumulativeY = 0;
+
+            this._stageHandler = global.stage.connect(
+                'captured-event::touchpad',
+                this._onEvent.bind(this),
+            );
+        }
+
+        destroy() {
+            if (this._stageHandler) {
+                global.stage.disconnect(this._stageHandler);
+                this._stageHandler = 0;
+            }
+        }
+
+        _onEvent(_actor, event) {
+            if (event.type() !== Clutter.EventType.TOUCHPAD_SWIPE)
+                return Clutter.EVENT_PROPAGATE;
+
+            if (!this._tunables.suppressOtherVerticalSwipes)
+                return Clutter.EVENT_PROPAGATE;
+
+            if (event.get_gesture_phase() === Clutter.TouchpadGesturePhase.BEGIN) {
+                this._state = TouchpadState.NONE;
+                this._cumulativeX = 0;
+                this._cumulativeY = 0;
+            }
+
+            if (this._state === TouchpadState.IGNORED)
+                return Clutter.EVENT_PROPAGATE;
+
+            // Our own finger count belongs to the real gestures, whichever
+            // way it goes.
+            if (event.get_touchpad_gesture_finger_count() === this._tunables.swipeFingers) {
+                this._state = TouchpadState.IGNORED;
+                return Clutter.EVENT_PROPAGATE;
+            }
+
+            if (this._state === TouchpadState.HANDLING)
+                return Clutter.EVENT_STOP;
+
+            const [dx, dy] = event.get_gesture_motion_delta_unaccelerated();
+            this._cumulativeX += dx;
+            this._cumulativeY += dy;
+
+            if (Math.hypot(this._cumulativeX, this._cumulativeY) < DRAG_THRESHOLD_PX)
+                return Clutter.EVENT_PROPAGATE;
+
+            if (Math.abs(this._cumulativeY) <= Math.abs(this._cumulativeX)) {
+                this._state = TouchpadState.IGNORED;
+                return Clutter.EVENT_PROPAGATE;
+            }
+
+            this._state = TouchpadState.HANDLING;
+            return Clutter.EVENT_STOP;
         }
     },
 );
@@ -792,8 +889,9 @@ class ShowDesktopGesture {
     constructor(settings) {
         this._settings = settings;
         this._tunables = new Tunables(settings);
-        // null, 'desktop' or 'mission'. The two modes share every actor and
-        // differ only in where clones are sent and what a click on one means.
+        // null, 'desktop', 'mission' or 'expose'. The modes share every actor
+        // and differ only in which windows were taken, where the clones are
+        // sent, and what a click on one means.
         this._mode = null;
         this._showingDesktop = false;
         this._minimizingWindows = [];
@@ -812,15 +910,24 @@ class ShowDesktopGesture {
         this._restoreHandlers = [];
         this._swipeDistance = primarySwipeDistance();
 
-        this._swipeTracker = createSwipeTracker(
+        this._swipeDown = createSwipeTracker(
             Shell.ActionMode.NORMAL, 'down', this._tunables);
-        this._touchpad = this._swipeTracker._touchpadGesture;
+        this._swipeUp = createSwipeTracker(
+            Shell.ActionMode.NORMAL, 'up', this._tunables);
+        // The downward gesture, kept for the swipe-to-restore path and for
+        // setting the swipe distance.
+        this._touchpad = this._swipeDown._touchpadGesture;
 
-        this._handlers = [
-            this._swipeTracker.connect('begin', this._onSwipeBegin.bind(this)),
-            this._swipeTracker.connect('update', this._onSwipeUpdate.bind(this)),
-            this._swipeTracker.connect('end', this._onSwipeEnd.bind(this)),
-        ];
+        this._handlers = [];
+        for (const [tracker, direction] of
+            [[this._swipeDown, 'down'], [this._swipeUp, 'up']]) {
+            this._handlers.push(
+                [tracker, tracker.connect('begin',
+                    (t, _monitor) => this._onSwipeBegin(t, direction))],
+                [tracker, tracker.connect('update', this._onSwipeUpdate.bind(this))],
+                [tracker, tracker.connect('end', this._onSwipeEnd.bind(this))],
+            );
+        }
 
         for (const monitor of Main.layoutManager.monitors)
             this._monitorGroups.push(new MonitorGroup(monitor, this._tunables));
@@ -836,6 +943,8 @@ class ShowDesktopGesture {
             if (this._gestureActive)
                 this._cancelActiveGesture(true);
         });
+
+        this._suppressor = new TouchpadVerticalSuppressor(this._tunables);
 
         this._pinch = new TouchpadPinch(this._tunables);
         this._pinchHandlers = [
@@ -871,7 +980,7 @@ class ShowDesktopGesture {
             () => this.toggle());
 
         this._stageKeyId = global.stage.connect('captured-event::key', (_actor, event) => {
-            if (this._mode !== 'mission' ||
+            if (!this._isGridMode() ||
                 event.type() !== Clutter.EventType.KEY_PRESS)
                 return Clutter.EVENT_PROPAGATE;
             if (event.get_key_symbol() !== Clutter.KEY_Escape)
@@ -960,10 +1069,13 @@ class ShowDesktopGesture {
             Main.overview.disconnect(this._overviewHiddenId);
             this._overviewHiddenId = 0;
         }
-        for (const id of this._handlers)
-            this._swipeTracker.disconnect(id);
+        for (const [tracker, id] of this._handlers)
+            tracker.disconnect(id);
         this._handlers = [];
-        this._swipeTracker.destroy();
+        this._swipeDown.destroy();
+        this._swipeUp.destroy();
+        this._suppressor.destroy();
+        this._suppressor = null;
         for (const g of this._monitorGroups)
             g.destroy();
         this._monitorGroups = [];
@@ -981,6 +1093,28 @@ class ShowDesktopGesture {
                 (win.is_always_on_all_workspaces() ||
                     win.get_workspace() === workspace),
             );
+    }
+
+    /**
+     * The focused application's windows, for App Expose.
+     *
+     * @returns {Meta.Window[]} windows of the focused app, or none
+     */
+    _collectAppWindows() {
+        const tracker = Shell.WindowTracker.get_default();
+        const app = tracker.focus_app;
+        if (!app)
+            return [];
+
+        const wins = this._collectWindows();
+        // The desktop is a window here, and not a spreadable type, so it is
+        // already absent from that list. Testing membership rather than the
+        // application's name keeps this from depending on which desktop-icons
+        // implementation is installed.
+        if (!wins.includes(global.display.focus_window))
+            return [];
+
+        return wins.filter(w => tracker.get_window_app(w) === app);
     }
 
     _cancelActiveGesture(animate) {
@@ -1010,14 +1144,44 @@ class ShowDesktopGesture {
         this._restoreSwipeDown = 0;
     }
 
-    _onSwipeBegin(tracker, _monitor) {
+    /**
+     * What a swipe in this direction is configured to do, as a layout, a set
+     * of windows and a mode -- or null when it should be left alone.
+     *
+     * @param {string} direction 'up' or 'down'
+     * @returns {object|null} arguments for _beginGesture, or null
+     */
+    _swipeIntent(direction) {
+        const action = direction === 'up'
+            ? this._tunables.swipeUpAction
+            : this._tunables.swipeDownAction;
+
+        switch (action) {
+        case 'mission-control':
+            return {layout: 'grid', windows: this._collectWindows(), mode: 'mission'};
+        case 'app-expose':
+            return {layout: 'grid', windows: this._collectAppWindows(), mode: 'expose'};
+        case 'show-desktop':
+            return {layout: 'edge', windows: this._collectWindows(), mode: 'desktop'};
+        default:
+            return null;
+        }
+    }
+
+    _onSwipeBegin(tracker, direction) {
         if (!isDesktopMode() || this._showingDesktop) {
             this._gestureActive = false;
             return;
         }
 
+        const intent = this._swipeIntent(direction);
+        if (!intent) {
+            this._gestureActive = false;
+            return;
+        }
+
         this._swipeDistance = primarySwipeDistance();
-        this._touchpad.setSwipeDistance(this._swipeDistance);
+        tracker._touchpadGesture.setSwipeDistance(this._swipeDistance);
 
         tracker.confirmSwipe(
             this._swipeDistance,
@@ -1026,11 +1190,7 @@ class ShowDesktopGesture {
             CANCEL_PROGRESS,
         );
 
-        if (!this._beginGesture({
-            layout: 'edge',
-            windows: this._collectWindows(),
-            mode: 'desktop',
-        })) {
+        if (!this._beginGesture(intent)) {
             this._gestureActive = false;
             this._minimizingWindows = [];
             return;
@@ -1081,6 +1241,24 @@ class ShowDesktopGesture {
         // the opposite of whatever is on screen is not a gesture at all.
         // Without this an inward pinch on a bare desktop would clone every
         // window and hide the originals only to reveal them again at rest.
+        // A spread with the launcher up dismisses it, rather than parking
+        // the windows behind it where they would be hidden by it anyway.
+        // macOS closes Launchpad with the reverse of the pinch that opened it.
+        if (!this._showingDesktop && scale > 1 && this._launcherIsOpen()) {
+            this._toggleLauncher();
+            this._pinch.cancel();
+            return;
+        }
+
+        // Pinching in with nothing parked has no spread to reverse. macOS
+        // opens Launchpad on that gesture rather than doing nothing.
+        if (!this._showingDesktop && scale < 1) {
+            if (this._tunables.pinchOpensLaunchpad)
+                this._toggleLauncher();
+            this._pinch.cancel();
+            return;
+        }
+
         if (this._showingDesktop !== (scale < 1)) {
             this._pinch.cancel();
             return;
@@ -1148,6 +1326,39 @@ class ShowDesktopGesture {
      */
     _travelled(progress) {
         return this._gestureDirection === 'restore' ? 1 - progress : progress;
+    }
+
+    /**
+     * Ask the overview for its app grid. A launcher extension that replaces
+     * the grid hooks Main.overview.show and diverts exactly that state to
+     * itself, so this reaches the launcher through a seam it already
+     * publishes rather than through its internals -- and with no such
+     * extension present it opens the stock grid, which is the honest
+     * fallback.
+     *
+     * It toggles rather than opens: the hook routes to the launcher's own
+     * toggle, so the same call closes a launcher that is already up.
+     */
+    _toggleLauncher() {
+        Main.overview.show(OverviewControls.ControlsState.APP_GRID);
+    }
+
+    /**
+     * Whether a launcher extension is on screen.
+     *
+     * Named by setting rather than hardcoded, and asked through the accessor
+     * it publishes rather than read out of its private state, so this works
+     * with any launcher that opts in and is simply off when none is named.
+     *
+     * @returns {boolean} true when a named launcher reports itself open
+     */
+    _launcherIsOpen() {
+        const uuid = this._tunables.launcherUuid;
+        if (!uuid)
+            return false;
+
+        return Main.extensionManager
+            .lookup(uuid)?.stateObj?.isLauncherOpen?.() === true;
     }
 
     _onPinchUpdate(_pinch, scale) {
@@ -1370,6 +1581,17 @@ class ShowDesktopGesture {
     /**
      * Spread every window of this workspace out to be picked from.
      */
+    /**
+     * Whether the windows are currently spread out to be picked from, either
+     * as Mission Control or as App Expose. The two differ only in which
+     * windows were taken, so everything after that treats them alike.
+     *
+     * @returns {boolean} true when a grid is up
+     */
+    _isGridMode() {
+        return this._mode === 'mission' || this._mode === 'expose';
+    }
+
     showMissionControl(duration = null) {
         if (this._showingDesktop || this._gestureActive || !isDesktopMode())
             return;
@@ -1395,7 +1617,7 @@ class ShowDesktopGesture {
      * @param {Meta.Window|null} win the window to raise, if any
      */
     hideMissionControl(win) {
-        if (this._mode !== 'mission')
+        if (!this._isGridMode())
             return;
 
         this._mode = null;
@@ -1420,14 +1642,17 @@ class ShowDesktopGesture {
     }
 
     toggleMissionControl() {
-        if (this._mode === 'mission')
+        // Any spread, not just this one: with App Expose up, showMissionControl
+        // would bail on its own showingDesktop guard and the key would do
+        // nothing at all.
+        if (this._isGridMode())
             this.hideMissionControl(null);
         else
             this.showMissionControl();
     }
 
     _onCloneClicked(win) {
-        if (this._mode === 'mission')
+        if (this._isGridMode())
             this.hideMissionControl(win);
         else
             this.restoreDesktop();
