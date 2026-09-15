@@ -38,5 +38,16 @@
       <summary>Pinch threshold</summary>
       <description>How far a four-finger pinch must close before the windows come back.</description>
     </key>
+    <key name="mission-control-toggle" type="as">
+      <default><![CDATA[['<Control><Super>Up']]]></default>
+      <summary>Show every window</summary>
+      <description>Spread the windows of the current workspace out to be picked from, the way Mission Control does. macOS uses Control+Up for this.</description>
+    </key>
+    <key name="grid-padding-px" type="i">
+      <default>24</default>
+      <range min="0" max="200"/>
+      <summary>Gap around the spread windows</summary>
+      <description>Space between the tiled windows and around the edge of the screen.</description>
+    </key>
   </schema>
 </schemalist>

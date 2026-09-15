@@ -62,6 +62,10 @@ class Tunables {
     get restoreScale() {
         return this._settings.get_double('pinch-restore-scale');
     }
+
+    get gridPadding() {
+        return this._settings.get_int('grid-padding-px');
+    }
 }
 
 // Windows are hidden rather than minimized while parked, so a parked window
@@ -78,6 +82,15 @@ const CLOSE_FALLBACK_US = 400000;
 // These arrive as TOUCHPAD_PINCH events carrying an absolute scale, which is
 // why a SwipeTracker cannot express them.
 const PINCH_FINGER_COUNT = 4;
+
+// Window types worth spreading. An allow list rather than a deny list, so a
+// type nobody thought about is left alone instead of being flung off screen.
+const SPREADABLE_TYPES = [
+    Meta.WindowType.NORMAL,
+    Meta.WindowType.DIALOG,
+    Meta.WindowType.MODAL_DIALOG,
+    Meta.WindowType.UTILITY,
+];
 
 // Emitted by the desktop-icons fork when a click lands on empty desktop.
 // DING owns that surface, so the shell never sees the press itself.
@@ -378,6 +391,10 @@ class MonitorGroup {
     constructor(monitor, tunables) {
         this.monitor = monitor;
         this._tunables = tunables;
+        // 'edge' parks windows off the side; 'grid' tiles them to be picked
+        // from. The two differ only in where a clone is sent, so everything
+        // else -- clones, animation, teardown -- is shared.
+        this._layout = 'edge';
         this._container = new Clutter.Actor({visible: false});
         this._container.add_constraint(new MonitorConstraint({index: monitor.index}));
         this._container.set_clip_to_allocation(true);
@@ -397,6 +414,41 @@ class MonitorGroup {
             this._container.destroy();
             this._container = null;
         }
+    }
+
+    setLayout(mode) {
+        this._layout = mode;
+    }
+
+    /**
+     * Tile every entry into the monitor so none overlaps, scaled to fit.
+     *
+     * Laid out for all entries at once rather than per entry, because a tile's
+     * size depends on how many there are.
+     */
+    _layoutGrid() {
+        const pad = this._tunables.gridPadding;
+        const n = this._entries.length;
+        if (n === 0)
+            return;
+
+        const cols = Math.ceil(Math.sqrt(n));
+        const rows = Math.ceil(n / cols);
+        const cellW = (this.monitor.width - pad * (cols + 1)) / cols;
+        const cellH = (this.monitor.height - pad * (rows + 1)) / rows;
+
+        this._entries.forEach((entry, i) => {
+            const col = i % cols;
+            const row = Math.floor(i / cols);
+            // Never scale a window up: a small window stays its own size
+            // rather than being blown up to fill a tile.
+            const scale = Math.min(cellW / entry.baseW, cellH / entry.baseH, 1);
+            const w = entry.baseW * scale;
+            const h = entry.baseH * scale;
+            entry.endScale = scale;
+            entry.endX = pad + col * (cellW + pad) + (cellW - w) / 2;
+            entry.endY = pad + row * (cellH + pad) + (cellH - h) / 2;
+        });
     }
 
     _layoutEntry(entry) {
@@ -441,7 +493,7 @@ class MonitorGroup {
             clone.set_pivot_point(0, 0);
             clone.reactive = true;
             clone.connect('button-press-event', () => {
-                this._onParkedClick?.();
+                this._onParkedClick?.(windowActor.meta_window);
                 return Clutter.EVENT_STOP;
             });
             windowActor.hide();
@@ -453,6 +505,9 @@ class MonitorGroup {
             // the wrong window covered its neighbour for the whole animation.
             this._container.insert_child_above(clone, null);
         }
+
+        if (this._layout === 'grid')
+            this._layoutGrid();
 
         if (this._entries.length > 0)
             this._container.show();
@@ -478,23 +533,31 @@ class MonitorGroup {
         this._applyProgress(progress);
     }
 
+    // Only ever reached with NORMAL: a parked entry keeps its clone and never
+    // gets here. Windows are hidden rather than minimized, so the only thing
+    // to undo is the hiding -- plus an unminimize for a window some other path
+    // minimized while it was parked.
     _applyWindowState(windowActor, desktopState) {
         const win = windowActor.meta_window;
-        if (!win?.can_minimize()) {
-            windowActor.show();
-            return;
-        }
         Main.wm.skipNextEffect(windowActor);
-        if (desktopState === DesktopState.NORMAL) {
+        if (win?.minimized)
             win.unminimize();
-            windowActor.show();
-        } else {
-            win.minimize();
-            windowActor.hide();
-        }
+        windowActor.show();
     }
 
-    _finishEntry(entry, progress, duration, windowState, onDone) {
+    /**
+     * @param entry - the clone and window this animates
+     * @param progress - lerp target, 0 for home and 1 for the parked position
+     * @param duration - animation length in ms
+     * @param windowState - what the window should end up as
+     * @param reveal - whether to hand the screen back to the real window here.
+     *   end() passes false and reveals every window at once instead: doing it
+     *   per window leaves some represented by real actors, which live in the
+     *   window group, and others still by clones, which sit above it -- so a
+     *   window flashes above one it is really below until the last clone goes.
+     * @param onDone - called once this entry has settled
+     */
+    _finishEntry(entry, progress, duration, windowState, reveal, onDone) {
         const {clone, windowActor} = entry;
         const p = progressToUnit(progress);
         const targetX = lerp(entry.startX, entry.endX, p);
@@ -505,15 +568,13 @@ class MonitorGroup {
 
         const finalize = () => {
             this._finishing -= 1;
-            if (windowState === DesktopState.SHOW_DESKTOP) {
-                // Parked: the clone stays at the edge standing in for the
-                // window, whose actor stays hidden. macOS leaves the windows
-                // there rather than minimizing them away.
-                onDone();
-                return;
+            // Parked entries keep their clone: it stands in for the window at
+            // the edge, whose actor stays hidden. macOS leaves the windows
+            // there rather than minimizing them away.
+            if (reveal && windowState !== DesktopState.SHOW_DESKTOP) {
+                this._applyWindowState(windowActor, windowState);
+                clone.destroy();
             }
-            this._applyWindowState(windowActor, windowState);
-            clone.destroy();
             onDone();
         };
 
@@ -551,12 +612,20 @@ class MonitorGroup {
 
         const done = () => {
             remaining -= 1;
-            if (remaining === 0 && !parking)
-                this._container.hide();
+            if (remaining > 0 || parking)
+                return;
+
+            // Every window comes back in the same frame, for the reason given
+            // on _finishEntry's reveal parameter.
+            for (const entry of entries) {
+                this._applyWindowState(entry.windowActor, windowState);
+                entry.clone.destroy();
+            }
+            this._container.hide();
         };
 
         for (const entry of entries)
-            this._finishEntry(entry, progress, duration, windowState, done);
+            this._finishEntry(entry, progress, duration, windowState, false, done);
 
         if (parking)
             this._parked = entries;
@@ -593,7 +662,7 @@ class MonitorGroup {
             return false;
 
         const [entry] = this._parked.splice(index, 1);
-        this._finishEntry(entry, 0, duration, DesktopState.NORMAL, () => {
+        this._finishEntry(entry, 0, duration, DesktopState.NORMAL, true, () => {
             if (this._parked.length === 0 && this._entries.length === 0)
                 this._container.hide();
         });
@@ -602,6 +671,22 @@ class MonitorGroup {
 
     hasParked() {
         return this._parked.length > 0;
+    }
+
+    /**
+     * Bring one parked clone to the front, so a window picked from the spread
+     * travels back over its neighbours instead of under them.
+     *
+     * @param {Meta.Window} win the window whose clone to raise
+     * @returns {boolean} whether that window is parked here
+     */
+    raiseCloneFor(win) {
+        const entry = this._parked.find(
+            e => e.windowActor.meta_window === win);
+        if (!entry)
+            return false;
+        this._container.set_child_above_sibling(entry.clone, null);
+        return true;
     }
 
     /**
@@ -628,7 +713,11 @@ class MonitorGroup {
 
 class ShowDesktopGesture {
     constructor(settings) {
+        this._settings = settings;
         this._tunables = new Tunables(settings);
+        // null, 'desktop' or 'mission'. The two modes share every actor and
+        // differ only in where clones are sent and what a click on one means.
+        this._mode = null;
         this._showingDesktop = false;
         this._minimizingWindows = [];
         this._monitorGroups = [];
@@ -685,7 +774,21 @@ class ShowDesktopGesture {
         );
 
         for (const group of this._monitorGroups)
-            group.setParkedClickHandler(() => this.restoreDesktop());
+            group.setParkedClickHandler(win => this._onCloneClicked(win));
+
+        Main.wm.addKeybinding('mission-control-toggle', this._settings,
+            Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this.toggleMissionControl());
+
+        this._stageKeyId = global.stage.connect('captured-event::key', (_actor, event) => {
+            if (this._mode !== 'mission' ||
+                event.type() !== Clutter.EventType.KEY_PRESS)
+                return Clutter.EVENT_PROPAGATE;
+            if (event.get_key_symbol() !== Clutter.KEY_Escape)
+                return Clutter.EVENT_PROPAGATE;
+            this.hideMissionControl(null);
+            return Clutter.EVENT_STOP;
+        });
 
         // A parked window's actor is hidden, so it must not be left focused
         // and invisible -- but only the window actually being asked for comes
@@ -724,13 +827,18 @@ class ShowDesktopGesture {
         this._monitorGroups = [];
         for (const monitor of Main.layoutManager.monitors) {
             const group = new MonitorGroup(monitor, this._tunables);
-            group.setParkedClickHandler(() => this.restoreDesktop());
+            group.setParkedClickHandler(win => this._onCloneClicked(win));
             this._monitorGroups.push(group);
         }
     }
 
     destroy() {
         this.resetShowDesktop();
+        Main.wm.removeKeybinding('mission-control-toggle');
+        if (this._stageKeyId) {
+            global.stage.disconnect(this._stageKeyId);
+            this._stageKeyId = 0;
+        }
         for (const id of this._displayHandlers)
             global.display.disconnect(id);
         this._displayHandlers = [];
@@ -777,11 +885,10 @@ class ShowDesktopGesture {
             .map(a => a.meta_window)
             .filter(win =>
                 win &&
-                win.get_window_type() !== Meta.WindowType.DESKTOP &&
+                SPREADABLE_TYPES.includes(win.get_window_type()) &&
                 !win.minimized &&
                 (win.is_always_on_all_workspaces() ||
-                    win.get_workspace() === workspace) &&
-                win.can_minimize(),
+                    win.get_workspace() === workspace),
             );
     }
 
@@ -910,9 +1017,11 @@ class ShowDesktopGesture {
         const dur = duration ?? this._tunables.duration;
         this._minimizingWindows = wins;
         for (const {group, actors} of groups) {
+            group.setLayout('edge');
             group.begin(actors);
             group.end(DesktopState.SHOW_DESKTOP, dur);
         }
+        this._mode = 'desktop';
         this._showingDesktop = true;
         this._parkedAt = GLib.get_monotonic_time();
     }
@@ -924,6 +1033,12 @@ class ShowDesktopGesture {
         const wins = this._minimizingWindows;
         this._minimizingWindows = [];
         this._showingDesktop = false;
+        // Every dismissal funnels through here -- gesture, sliver click,
+        // desktop click, Escape -- so the mode is cleared here rather than in
+        // each caller, and the groups go back to the parking layout.
+        this._mode = null;
+        for (const group of this._monitorGroups)
+            group.setLayout('edge');
 
         const dur = duration ?? this._tunables.duration;
         let unparked = false;
@@ -993,7 +1108,80 @@ class ShowDesktopGesture {
         if (!this._monitorGroups.some(group => group.hasParked())) {
             this._showingDesktop = false;
             this._minimizingWindows = [];
+            this._mode = null;
         }
+    }
+
+    /**
+     * Spread every window of this workspace out to be picked from.
+     */
+    showMissionControl(duration = null) {
+        if (this._showingDesktop || this._gestureActive || !isDesktopMode())
+            return;
+
+        const wins = this._collectWindows();
+        if (wins.length === 0)
+            return;
+
+        const groups = this._groupActorsByMonitor(wins);
+        if (groups.length === 0)
+            return;
+
+        const dur = duration ?? this._tunables.duration;
+        this._minimizingWindows = wins;
+        for (const {group, actors} of groups) {
+            group.setLayout('grid');
+            group.begin(actors);
+            group.end(DesktopState.SHOW_DESKTOP, dur);
+        }
+        this._mode = 'mission';
+        this._showingDesktop = true;
+        this._parkedAt = GLib.get_monotonic_time();
+    }
+
+    /**
+     * Put the windows back. Activating one is what picking it means; passing
+     * nothing is a cancel.
+     *
+     * @param {Meta.Window|null} win the window to raise, if any
+     */
+    hideMissionControl(win) {
+        if (this._mode !== 'mission')
+            return;
+
+        this._mode = null;
+
+        // Raise before restoring: the clones are stacked in window order, so a
+        // picked window would otherwise travel home underneath its neighbours.
+        if (win) {
+            for (const group of this._monitorGroups)
+                group.raiseCloneFor(win);
+
+            // Raise and focus now, while every window actor is still hidden.
+            // Raising fixes the stacking before the reveal, so a window picked
+            // from the bottom does not arrive underneath its neighbours.
+            //
+            // activate() both raises and focuses, and doing it here rather
+            // than after the animation keeps the whole pick one ordered
+            // sequence instead of an animation racing a timer.
+            win.activate(global.get_current_time());
+        }
+
+        this.restoreDesktop(this._tunables.duration);
+    }
+
+    toggleMissionControl() {
+        if (this._mode === 'mission')
+            this.hideMissionControl(null);
+        else
+            this.showMissionControl();
+    }
+
+    _onCloneClicked(win) {
+        if (this._mode === 'mission')
+            this.hideMissionControl(win);
+        else
+            this.restoreDesktop();
     }
 
     toggle() {
