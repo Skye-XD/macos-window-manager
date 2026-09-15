@@ -1698,12 +1698,70 @@ class ShowDesktopGesture {
 
 export default class ThreeFingerShowDesktopExtension extends Extension {
     enable() {
-        this._gesture = new ShowDesktopGesture(this.getSettings());
+        this._settings = this.getSettings();
+        this._suppressStartupOverview();
+        this._gesture = new ShowDesktopGesture(this._settings);
     }
 
     disable() {
+        this._restoreStartupOverview();
         this._gesture?.resetShowDesktop();
         this._gesture?.destroy();
         this._gesture = null;
+        this._settings = null;
+    }
+
+    /**
+     * Keep the stock overview off the screen at login.
+     *
+     * `sessionMode.user.hasOverview` is true, so the shell's startup animation
+     * calls `overview.runStartupAnimation()`, which sets the shown state
+     * directly. It never goes through `show()` -- which is why hooking that,
+     * the obvious place, does nothing here.
+     *
+     * Replacing the animation with a no-op leaves the UI group alone: it is
+     * only scaled down in the *no*-overview branch of
+     * `_prepareStartupAnimation`, so with an overview there is nothing to
+     * animate back and skipping it simply leaves the desktop showing.
+     *
+     * Whether the extension is enabled before that animation runs is a race
+     * between two async chains in the shell, so the late case is handled too:
+     * hide what is already up. That leaves a flash, and the log line says
+     * which of the two happened.
+     */
+    _suppressStartupOverview() {
+        if (!this._settings.get_boolean('suppress-startup-overview'))
+            return;
+
+        if (!Main.layoutManager._startingUp) {
+            // Enabled by hand, well after login. Nothing to suppress, and
+            // hooking now would only outlive its purpose.
+            return;
+        }
+
+        if (Main.overview.visible) {
+            // Too late: the animation already ran.
+            Main.overview.hide();
+            console.log('[show-desktop] startup overview: too late, hid it');
+            return;
+        }
+
+        this._origRunStartupAnimation = Main.overview.runStartupAnimation;
+        Main.overview.runStartupAnimation = async () => {};
+        console.log('[show-desktop] startup overview: suppressed before it ran');
+
+        this._startupCompleteId = Main.layoutManager.connect('startup-complete',
+            () => this._restoreStartupOverview());
+    }
+
+    _restoreStartupOverview() {
+        if (this._startupCompleteId) {
+            Main.layoutManager.disconnect(this._startupCompleteId);
+            this._startupCompleteId = 0;
+        }
+        if (this._origRunStartupAnimation) {
+            Main.overview.runStartupAnimation = this._origRunStartupAnimation;
+            this._origRunStartupAnimation = null;
+        }
     }
 }

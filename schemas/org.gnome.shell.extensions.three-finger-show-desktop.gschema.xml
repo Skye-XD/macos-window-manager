@@ -55,6 +55,11 @@
       <summary>Swallow vertical swipes with a different finger count</summary>
       <description>GNOME's overview answers to any vertical swipe of three or more fingers, so raising swipe-finger-count leaves the lower counts still opening it. This consumes those. Horizontal swipes are never touched, so switching workspaces keeps working.</description>
     </key>
+    <key name="suppress-startup-overview" type="b">
+      <default>false</default>
+      <summary>Keep the stock overview off the screen at login</summary>
+      <description>The shell opens the overview at login because sessionMode.user.hasOverview is true, which makes the startup animation call overview.runStartupAnimation(). That sets the shown state directly and never goes through show(), so hooking show() does not prevent it. This replaces the animation with a no-op for the duration of startup.</description>
+    </key>
     <key name="launcher-extension-uuid" type="s">
       <default>''</default>
       <summary>Launcher extension a spread should dismiss</summary>
