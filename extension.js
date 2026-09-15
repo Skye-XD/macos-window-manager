@@ -618,20 +618,50 @@ class MonitorGroup {
         // the sliver whole and leave nothing showing. Measure against the
         // visible frame instead.
         const frame = entry.windowActor.meta_window?.get_frame_rect?.();
-        const inset = frame ? frame.x - entry.windowActor.x : 0;
+        const insetX = frame ? frame.x - entry.windowActor.x : 0;
+        const insetY = frame ? frame.y - entry.windowActor.y : 0;
         const frameW = frame ? frame.width : entry.baseW;
+        const frameH = frame ? frame.height : entry.baseH;
 
-        // Windows only ever leave sideways -- macOS never sends one off the
-        // top or the bottom -- so the side is decided by which half of the
-        // monitor the visible frame's centre sits in, and the vertical
-        // position is left alone.
+        // Three edges, never the bottom: macOS pushes windows off the sides
+        // and the top, and a window sent downwards would travel behind the
+        // dock and read as minimizing rather than parking.
+        //
+        // Measured against the work area, not the monitor. A sliver parked at
+        // the monitor's top edge sits behind the panel, where it can neither
+        // be seen nor clicked to bring its window back -- and the same is true
+        // of any side a dock reserves space on. The work area already excludes
+        // every such strut.
+        //
+        // Which edge is decided by how far the visible frame already sits from
+        // each one, so a window hugging the top goes up rather than crossing
+        // the whole screen sideways. The top has to be strictly nearer than
+        // both sides to win, which leaves the horizontal case -- including a
+        // maximised window, where every gap is zero -- on the rule it has
+        // always used: whichever half the frame's centre is in.
         const peek = this._tunables.peek;
-        const centre = entry.startX + inset + frameW / 2;
+        const workArea = Main.layoutManager.getWorkAreaForMonitor(this.monitor.index);
+        const areaX = workArea.x - this.monitor.x;
+        const areaY = workArea.y - this.monitor.y;
+        const areaW = workArea.width;
 
+        const frameX = entry.startX + insetX;
+        const frameY = entry.startY + insetY;
+        const gapLeft = frameX - areaX;
+        const gapRight = areaX + areaW - (frameX + frameW);
+        const gapTop = frameY - areaY;
+
+        entry.endX = entry.startX;
         entry.endY = entry.startY;
-        entry.endX = centre < this.monitor.width / 2
-            ? peek - inset - frameW
-            : this.monitor.width - peek - inset;
+
+        if (gapTop < gapLeft && gapTop < gapRight) {
+            entry.endY = areaY + peek - insetY - frameH;
+        } else {
+            const centre = frameX + frameW / 2;
+            entry.endX = centre < areaX + areaW / 2
+                ? areaX + peek - insetX - frameW
+                : areaX + areaW - peek - insetX;
+        }
     }
 
     begin(windowActors) {
