@@ -936,7 +936,10 @@ class ShowDesktopGesture {
         // does the opposite of what the gesture was doing whatever the windows
         // happen to be in the middle of.
         this._gestureDirection = null;
-        this._restoreSwipeDown = 0;
+        // Which swipe direction raised the current spread, so the opposite
+        // one can put it back. Null when it was raised some other way.
+        this._openedBy = null;
+        this._restoreSwipe = 0;
         this._restoreHandlers = [];
         this._swipeDistance = primarySwipeDistance();
 
@@ -944,9 +947,6 @@ class ShowDesktopGesture {
             Shell.ActionMode.NORMAL, 'down', this._tunables);
         this._swipeUp = createSwipeTracker(
             Shell.ActionMode.NORMAL, 'up', this._tunables);
-        // The downward gesture, kept for the swipe-to-restore path and for
-        // setting the swipe distance.
-        this._touchpad = this._swipeDown._touchpadGesture;
 
         this._handlers = [];
         for (const [tracker, direction] of
@@ -1034,18 +1034,31 @@ class ShowDesktopGesture {
             }),
         ];
 
-        this._restoreHandlers = [
-            this._touchpad.connect('begin', () => {
-                if (this._showingDesktop && !this._gestureActive)
-                    this._restoreSwipeDown = 0;
-            }),
-            this._touchpad.connect('update', (_t, _time, dy, _dist) => {
-                if (!this._showingDesktop || this._gestureActive)
-                    return;
-                this._restoreSwipeDown += dy > 0 ? dy : 0;
-            }),
-            this._touchpad.connect('end', this._onTouchpadEndForRestore.bind(this)),
-        ];
+        // Both directions, not just down. Watching only the downward gesture
+        // meant a downward swipe was the sole way to dismiss anything,
+        // whatever had raised it: an upward swipe could not put back what it
+        // had opened, and Mission Control answered to the wrong direction.
+        this._restoreHandlers = [];
+        for (const [tracker, direction] of
+            [[this._swipeDown, 'down'], [this._swipeUp, 'up']]) {
+            const gesture = tracker._touchpadGesture;
+            this._restoreHandlers.push(
+                [gesture, gesture.connect('begin', () => {
+                    if (this._showingDesktop && !this._gestureActive)
+                        this._restoreSwipe = 0;
+                })],
+                [gesture, gesture.connect('update', (_t, _time, delta) => {
+                    if (!this._showingDesktop || this._gestureActive)
+                        return;
+                    // The delta arrives positive in this gesture's own
+                    // direction, so both are counted the same way.
+                    if (delta > 0)
+                        this._restoreSwipe += delta;
+                })],
+                [gesture, gesture.connect('end',
+                    () => this._onSwipeEndForRestore(direction))],
+            );
+        }
     }
 
     _rebuildMonitorGroups() {
@@ -1084,8 +1097,8 @@ class ShowDesktopGesture {
         this._pinchHandlers = [];
         this._pinch.destroy();
         this._pinch = null;
-        for (const id of this._restoreHandlers)
-            this._touchpad.disconnect(id);
+        for (const [gesture, id] of this._restoreHandlers)
+            gesture.disconnect(id);
         this._restoreHandlers = [];
         if (this._monitorsChangedId) {
             Main.layoutManager.disconnect(this._monitorsChangedId);
@@ -1166,12 +1179,48 @@ class ShowDesktopGesture {
         this._settleAfterGesture(DesktopState.NORMAL);
     }
 
-    _onTouchpadEndForRestore() {
+    /**
+     * @param {string} direction the direction of the swipe that just ended
+     */
+    _onSwipeEndForRestore(direction) {
+        const travelled = this._restoreSwipe;
+        this._restoreSwipe = 0;
+
         if (!this._showingDesktop || this._gestureActive)
             return;
-        if (this._restoreSwipeDown >= ACTIVATION_DOWN_PX)
+        if (travelled < ACTIVATION_DOWN_PX)
+            return;
+        if (this._dismissesSpread(direction))
             this._restoreAll();
-        this._restoreSwipeDown = 0;
+    }
+
+    /**
+     * Whether a swipe in this direction puts the current spread back.
+     *
+     * The counteraction of whatever raised it, normally: up closes what a
+     * downward swipe opened, and down closes what an upward one did.
+     *
+     * When the counter direction has no gesture of its own there is nothing
+     * to pair with, so the raising direction repeated dismisses instead --
+     * which is what the defaults do, and what this is on top of. Raised some
+     * other way, by the keyboard, a desktop click or the pinch, there is no
+     * opening swipe to answer, so downward dismisses as it always has.
+     *
+     * @param {string} direction the direction of the swipe that just ended
+     * @returns {boolean} whether it should restore
+     */
+    _dismissesSpread(direction) {
+        if (this._openedBy === null)
+            return direction === 'down';
+
+        const counter = this._openedBy === 'down' ? 'up' : 'down';
+        if (direction === counter)
+            return true;
+
+        const counterAction = counter === 'up'
+            ? this._tunables.swipeUpAction
+            : this._tunables.swipeDownAction;
+        return counterAction === 'none';
     }
 
     /**
@@ -1226,6 +1275,8 @@ class ShowDesktopGesture {
             return;
         }
 
+        // Recorded after _beginGesture, which clears it.
+        this._openedBy = direction;
         this._gestureActive = true;
     }
 
@@ -1239,7 +1290,7 @@ class ShowDesktopGesture {
 
     _onSwipeEnd(_tracker, duration, endProgress) {
         if (!this._gestureActive) {
-            this._restoreSwipeDown = 0;
+            this._restoreSwipe = 0;
             return;
         }
 
@@ -1479,6 +1530,9 @@ class ShowDesktopGesture {
         if (groups.length === 0)
             return false;
 
+        // Cleared here so a spread raised by the keyboard or a click does not
+        // inherit the direction of whatever swipe came before it.
+        this._openedBy = null;
         this._minimizingWindows = windows;
         for (const {group, actors} of groups) {
             group.setLayout(layout);
