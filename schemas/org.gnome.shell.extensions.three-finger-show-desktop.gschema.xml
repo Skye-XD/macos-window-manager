@@ -94,6 +94,11 @@
       <summary>Show every window</summary>
       <description>Spread the windows of the current workspace out to be picked from, the way Mission Control does. macOS uses Control+Up for this.</description>
     </key>
+    <key name="app-expose-toggle" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Show this application's windows</summary>
+      <description>Spread out the windows of the focused application only, the way App Expose does, and put them back when pressed again. Empty by default, as upstream binds nothing here. macOS uses Control+Down.</description>
+    </key>
     <key name="show-desktop-toggle" type="as">
       <default><![CDATA[['<Control><Super>Up', '<Super>d']]]></default>
       <summary>Show the desktop</summary>

@@ -1037,7 +1037,11 @@ class ShowDesktopGesture {
 
         Main.wm.addKeybinding('mission-control-toggle', this._settings,
             Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
-            () => this.toggleMissionControl());
+            () => this.toggleSpread('mission'));
+
+        Main.wm.addKeybinding('app-expose-toggle', this._settings,
+            Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this.toggleSpread('expose'));
 
         // The same toggle the gestures and DING's desktop click reach, so the
         // keyboard is one more way in rather than a second code path.
@@ -1051,7 +1055,7 @@ class ShowDesktopGesture {
                 return Clutter.EVENT_PROPAGATE;
             if (event.get_key_symbol() !== Clutter.KEY_Escape)
                 return Clutter.EVENT_PROPAGATE;
-            this.hideMissionControl(null);
+            this.hideSpread(null);
             return Clutter.EVENT_STOP;
         });
 
@@ -1111,6 +1115,7 @@ class ShowDesktopGesture {
     destroy() {
         this.resetShowDesktop();
         Main.wm.removeKeybinding('mission-control-toggle');
+        Main.wm.removeKeybinding('app-expose-toggle');
         Main.wm.removeKeybinding('show-desktop-toggle');
         if (this._stageKeyId) {
             global.stage.disconnect(this._stageKeyId);
@@ -1682,14 +1687,23 @@ class ShowDesktopGesture {
         return this._mode === 'mission' || this._mode === 'expose';
     }
 
-    showMissionControl(duration = null) {
+    /**
+     * Spread the windows out without a gesture, for the keyboard.
+     *
+     * @param {string} mode 'mission' for every window on the workspace,
+     *   'expose' for the focused application's only
+     * @param {number|null} duration animation length in ms, or the default
+     */
+    showSpread(mode = 'mission', duration = null) {
         if (this._showingDesktop || this._gestureActive || !isDesktopMode())
             return;
 
         if (!this._beginGesture({
             layout: 'grid',
-            windows: this._collectWindows(),
-            mode: 'mission',
+            windows: mode === 'expose'
+                ? this._collectAppWindows()
+                : this._collectWindows(),
+            mode,
         }))
             return;
 
@@ -1706,7 +1720,7 @@ class ShowDesktopGesture {
      *
      * @param {Meta.Window|null} win the window to raise, if any
      */
-    hideMissionControl(win) {
+    hideSpread(win) {
         if (!this._isGridMode())
             return;
 
@@ -1731,19 +1745,22 @@ class ShowDesktopGesture {
         this.restoreDesktop(this._tunables.duration);
     }
 
-    toggleMissionControl() {
-        // Any spread, not just this one: with App Expose up, showMissionControl
-        // would bail on its own showingDesktop guard and the key would do
-        // nothing at all.
+    /**
+     * @param {string} mode which spread the key asks for, when none is up
+     */
+    toggleSpread(mode = 'mission') {
+        // Any spread, not just the one this key opens: with App Expose up,
+        // showSpread would bail on its own showingDesktop guard and
+        // Control+Up would do nothing at all.
         if (this._isGridMode())
-            this.hideMissionControl(null);
+            this.hideSpread(null);
         else
-            this.showMissionControl();
+            this.showSpread(mode);
     }
 
     _onCloneClicked(win) {
         if (this._isGridMode())
-            this.hideMissionControl(win);
+            this.hideSpread(win);
         else
             this.restoreDesktop();
     }
