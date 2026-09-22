@@ -55,6 +55,11 @@
       <summary>Swallow vertical swipes with a different finger count</summary>
       <description>GNOME's overview answers to any vertical swipe of three or more fingers, so raising swipe-finger-count leaves the lower counts still opening it. This consumes those. Horizontal swipes are never touched, so switching workspaces keeps working.</description>
     </key>
+    <key name="panel-drag-primary-only" type="b">
+      <default>false</default>
+      <summary>Only a left click on the panel drags the window below</summary>
+      <description>The top panel drags whatever maximised window sits under the pointer. The shell's gesture answers to every button, so a right or middle click grabs the window too. Turning this on limits it to the primary button, which is what the code it replaced did. Off by default, matching the shell as it ships.</description>
+    </key>
     <key name="suppress-startup-overview" type="b">
       <default>false</default>
       <summary>Keep the stock overview off the screen at login</summary>

@@ -1836,11 +1836,13 @@ export default class ThreeFingerShowDesktopExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
         this._suppressStartupOverview();
+        this._restrictPanelDrag();
         this._gesture = new ShowDesktopGesture(this._settings);
     }
 
     disable() {
         this._restoreStartupOverview();
+        this._releasePanelDrag();
         this._gesture?.resetShowDesktop();
         this._gesture?.destroy();
         this._gesture = null;
@@ -1888,6 +1890,42 @@ export default class ThreeFingerShowDesktopExtension extends Extension {
 
         this._startupCompleteId = Main.layoutManager.connect('startup-complete',
             () => this._restoreStartupOverview());
+    }
+
+    /**
+     * Let only a primary click on the panel drag the window beneath it.
+     *
+     * The panel drags whatever maximised window sits under the pointer, which
+     * is a feature -- but it answers to every button. `Clutter.ClickGesture`
+     * takes a `required-button`, and 0, its default, means any button; the
+     * shell constructs the panel's gesture without setting it, so a right- or
+     * middle-click on the panel grabs the window instead of doing nothing.
+     * The `button-press-event` path it replaced tested for
+     * `Clutter.BUTTON_PRIMARY`, so this is a regression rather than a choice.
+     *
+     * A property, not a patched method: the gesture object is the shell's, and
+     * the old value goes back on disable.
+     */
+    _restrictPanelDrag() {
+        if (!this._settings.get_boolean('panel-drag-primary-only'))
+            return;
+
+        const gesture = Main.panel._clickGesture;
+        if (!gesture || gesture.required_button === undefined)
+            return;
+
+        this._origPanelDragButton = gesture.required_button;
+        gesture.required_button = Clutter.BUTTON_PRIMARY;
+    }
+
+    _releasePanelDrag() {
+        if (this._origPanelDragButton === undefined)
+            return;
+
+        const gesture = Main.panel._clickGesture;
+        if (gesture)
+            gesture.required_button = this._origPanelDragButton;
+        this._origPanelDragButton = undefined;
     }
 
     _restoreStartupOverview() {
