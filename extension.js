@@ -21,6 +21,11 @@ const CANCEL_PROGRESS = 0.15;
 const MIN_FINISH_DURATION_MS = 120;
 const SWIPE_MULTIPLIER = 1;
 
+// How near an edge a window has to sit, as a fraction of the room it has to
+// move on that axis, before it will leave by that edge as well as by its
+// nearest one. A third puts the corners at the corner ninths of the screen.
+const CORNER_BAND = 1 / 3;
+
 // macOS pushes each window off whichever screen edge it already sits nearest,
 // at full size and full opacity, and *parks* it there: a sliver stays on
 // screen and the window is never minimized. Clicking a sliver pulls them back.
@@ -623,44 +628,78 @@ class MonitorGroup {
         const frameW = frame ? frame.width : entry.baseW;
         const frameH = frame ? frame.height : entry.baseH;
 
-        // Three edges, never the bottom: macOS pushes windows off the sides
-        // and the top, and a window sent downwards would travel behind the
-        // dock and read as minimizing rather than parking.
+        // All four edges, and corners, as macOS does: a window leaves by the
+        // edge it already sits nearest, and one sitting near two of them
+        // leaves by both at once.
         //
         // Measured against the work area, not the monitor. A sliver parked at
         // the monitor's top edge sits behind the panel, where it can neither
         // be seen nor clicked to bring its window back -- and the same is true
         // of any side a dock reserves space on. The work area already excludes
         // every such strut.
-        //
-        // Which edge is decided by how far the visible frame already sits from
-        // each one, so a window hugging the top goes up rather than crossing
-        // the whole screen sideways. The top has to be strictly nearer than
-        // both sides to win, which leaves the horizontal case -- including a
-        // maximised window, where every gap is zero -- on the rule it has
-        // always used: whichever half the frame's centre is in.
         const peek = this._tunables.peek;
         const workArea = Main.layoutManager.getWorkAreaForMonitor(this.monitor.index);
         const areaX = workArea.x - this.monitor.x;
         const areaY = workArea.y - this.monitor.y;
         const areaW = workArea.width;
+        const areaH = workArea.height;
 
         const frameX = entry.startX + insetX;
         const frameY = entry.startY + insetY;
         const gapLeft = frameX - areaX;
         const gapRight = areaX + areaW - (frameX + frameW);
         const gapTop = frameY - areaY;
+        const gapBottom = areaY + areaH - (frameY + frameH);
+
+        // Nearness has to be relative to the room the window has to move in,
+        // not an absolute gap, or a wide window would always read as hugging
+        // the sides. Zero room means the window spans the work area on that
+        // axis and has no position on it to speak of, so it is not near
+        // either of those edges -- which is what keeps a maximised or
+        // full-width window from counting as cornered.
+        const roomX = areaW - frameW;
+        const roomY = areaH - frameH;
+        const relH = roomX > 0 ? Math.min(gapLeft, gapRight) / roomX : Infinity;
+        const relV = roomY > 0 ? Math.min(gapTop, gapBottom) / roomY : Infinity;
+
+        // One axis carries the window off the screen, the nearer one. Ties
+        // fall to the horizontal, which is where a centred or maximised
+        // window ends up -- the case this has always sent sideways.
+        const parkH = relH <= relV;
+
+        // A window near two edges is cornered, and goes to that corner by
+        // sliding ALONG its edge to meet it rather than leaving past both.
+        //
+        // Leaving past both is what a diagonal park means, and it hides the
+        // window almost entirely: a rectangle pushed past two edges shows
+        // only where its two slivers overlap, a peek-by-peek square, however
+        // large the window is. Staying inside on the second axis keeps the
+        // whole strip in view -- the window's full height down a side, or its
+        // full width along the top -- so every parked window can still be
+        // read and picked, and the corner reads as a corner anyway.
+        const cornered = Math.max(relH, relV) <= CORNER_BAND;
 
         entry.endX = entry.startX;
         entry.endY = entry.startY;
 
-        if (gapTop < gapLeft && gapTop < gapRight) {
-            entry.endY = areaY + peek - insetY - frameH;
-        } else {
-            const centre = frameX + frameW / 2;
-            entry.endX = centre < areaX + areaW / 2
+        if (parkH) {
+            entry.endX = gapLeft <= gapRight
                 ? areaX + peek - insetX - frameW
                 : areaX + areaW - peek - insetX;
+            if (cornered) {
+                entry.endY = gapTop <= gapBottom
+                    ? areaY - insetY
+                    : areaY + areaH - frameH - insetY;
+            }
+        } else {
+            entry.endY = gapTop <= gapBottom
+                ? areaY + peek - insetY - frameH
+                : areaY + areaH - peek - insetY;
+            if (cornered) {
+                entry.endX = gapLeft <= gapRight
+                    ? areaX - insetX
+                    : areaX + areaW - frameW - insetX;
+            }
         }
     }
 
