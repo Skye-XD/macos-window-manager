@@ -1625,13 +1625,42 @@ class ShowDesktopGesture {
             return;
 
         const focused = global.display.focus_window;
-        if (!focused || !this._minimizingWindows.includes(focused))
+        if (!focused)
             return;
 
-        // Focus landing on a parked window right after a close is the stack
-        // falling through, not the user asking for that window. Hand focus to
-        // the desktop and leave everything parked, the way macOS does.
-        if (GLib.get_monotonic_time() - this._windowClosedAt < CLOSE_FALLBACK_US) {
+        // Focus arriving right after a close is the stack falling through,
+        // not the user asking for that window.
+        const settlingAfterClose =
+            GLib.get_monotonic_time() - this._windowClosedAt < CLOSE_FALLBACK_US;
+
+        // A spread ends as soon as any window takes the focus: picked from
+        // the dock, reached by Alt+Tab, or freshly launched. That means the
+        // same thing as clicking its tile, so it goes through the same path.
+        //
+        // Membership of _minimizingWindows is deliberately NOT required here.
+        // A window that has just started did not exist when the spread began,
+        // so it is not in that list, and testing it first left the grid
+        // sitting on top of the application that had only just opened.
+        //
+        // No recursion: hideSpread activates the window, but it is already
+        // the focus window here, so the property does not change and this
+        // does not run again.
+        if (this._isGridMode()) {
+            // Closing a window while the grid is up leaves the grid up, as
+            // macOS does -- the focus moved on its own, nothing was picked.
+            if (!settlingAfterClose)
+                this.hideSpread(focused);
+            return;
+        }
+
+        // Parked windows only, below: the desktop is showing, and a window
+        // that was never parked has nothing to come back from.
+        if (!this._minimizingWindows.includes(focused))
+            return;
+
+        // Hand focus to the desktop and leave everything parked, the way
+        // macOS does.
+        if (settlingAfterClose) {
             this._focusDesktop();
             return;
         }
