@@ -564,6 +564,7 @@ class MonitorGroup {
         this._parked = [];
         this._finishing = 0;
         this._onParkedClick = null;
+        this._onWindowGone = null;
     }
 
     destroy() {
@@ -590,10 +591,17 @@ class MonitorGroup {
         if (n === 0)
             return;
 
+        // Within the work area, as parking is: the container sits under the
+        // panel and the dock, so a row laid against the monitor's edge runs
+        // underneath them. The container spans the monitor, hence the offset.
+        const area = Main.layoutManager.getWorkAreaForMonitor(this.monitor.index);
+        const offX = area.x - this.monitor.x;
+        const offY = area.y - this.monitor.y;
+
         const cols = Math.ceil(Math.sqrt(n));
         const rows = Math.ceil(n / cols);
-        const cellW = (this.monitor.width - pad * (cols + 1)) / cols;
-        const cellH = (this.monitor.height - pad * (rows + 1)) / rows;
+        const cellW = (area.width - pad * (cols + 1)) / cols;
+        const cellH = (area.height - pad * (rows + 1)) / rows;
 
         this._entries.forEach((entry, i) => {
             const col = i % cols;
@@ -604,8 +612,8 @@ class MonitorGroup {
             const w = entry.baseW * scale;
             const h = entry.baseH * scale;
             entry.endScale = scale;
-            entry.endX = pad + col * (cellW + pad) + (cellW - w) / 2;
-            entry.endY = pad + row * (cellH + pad) + (cellH - h) / 2;
+            entry.endX = offX + pad + col * (cellW + pad) + (cellW - w) / 2;
+            entry.endY = offY + pad + row * (cellH + pad) + (cellH - h) / 2;
         });
     }
 
@@ -714,12 +722,13 @@ class MonitorGroup {
             });
             clone.set_pivot_point(0, 0);
             clone.reactive = true;
+            const entry = {clone, windowActor};
+            entry.destroyId = windowActor.connect('destroy', () => this._forgetEntry(entry));
             clone.connect('button-press-event', () => {
                 this._onParkedClick?.(windowActor.meta_window);
                 return Clutter.EVENT_STOP;
             });
             windowActor.hide();
-            const entry = {clone, windowActor};
             this._layoutEntry(entry);
             this._entries.push(entry);
             // Window actors arrive bottom to top, so each clone goes on top of
@@ -755,16 +764,41 @@ class MonitorGroup {
         this._applyProgress(progress);
     }
 
-    // Only ever reached with NORMAL: a parked entry keeps its clone and never
-    // gets here. Windows are hidden rather than minimized, so the only thing
-    // to undo is the hiding -- plus an unminimize for a window some other path
-    // minimized while it was parked.
-    _applyWindowState(windowActor, desktopState) {
-        const win = windowActor.meta_window;
-        Main.wm.skipNextEffect(windowActor);
-        if (win?.minimized)
-            win.unminimize();
-        windowActor.show();
+    /**
+     * Retire an entry: drop its clone and give the screen back to the window.
+     * Windows are hidden rather than minimized, so the only thing to undo is
+     * the hiding, plus an unminimize for a window some other path minimized
+     * while it was parked. An entry whose window has closed has already been
+     * torn down by its destroy handler.
+     *
+     * @param entry - the clone and window to release
+     */
+    _releaseEntry(entry) {
+        if (entry.gone)
+            return;
+        entry.gone = true;
+        entry.windowActor.disconnect(entry.destroyId);
+        entry.clone.destroy();
+        revealWindow(entry.windowActor);
+    }
+
+    /**
+     * A window closed while one of our clones stood in for it. Drop the entry
+     * outright: its actor is being disposed, and leaving it would keep a
+     * zero-size "parked" window that makes the next desktop click a dead
+     * restore, and a later show() on the dead actor could throw part way
+     * through revealing the others.
+     *
+     * @param entry - the entry whose window closed
+     */
+    _forgetEntry(entry) {
+        entry.gone = true;
+        this._entries = this._entries.filter(e => e !== entry);
+        this._parked = this._parked.filter(e => e !== entry);
+        entry.clone.destroy();
+        if (this._entries.length === 0 && this._parked.length === 0 && this._finishing <= 0)
+            this._container.hide();
+        this._onWindowGone?.(entry.windowActor.meta_window);
     }
 
     /**
@@ -780,7 +814,7 @@ class MonitorGroup {
      * @param onDone - called once this entry has settled
      */
     _finishEntry(entry, progress, duration, windowState, reveal, onDone) {
-        const {clone, windowActor} = entry;
+        const {clone} = entry;
         const p = progressToUnit(progress);
         const targetX = lerp(entry.startX, entry.endX, p);
         const targetY = lerp(entry.startY, entry.endY, p);
@@ -789,14 +823,14 @@ class MonitorGroup {
         clone.remove_all_transitions();
 
         const finalize = () => {
-            this._finishing -= 1;
+            // Clamped: abort() zeroes the count while an end() it cannot see
+            // may still have entries in flight, and those finish later.
+            this._finishing = Math.max(0, this._finishing - 1);
             // Parked entries keep their clone: it stands in for the window at
             // the edge, whose actor stays hidden. macOS leaves the windows
             // there rather than minimizing them away.
-            if (reveal && windowState !== DesktopState.SHOW_DESKTOP) {
-                this._applyWindowState(windowActor, windowState);
-                clone.destroy();
-            }
+            if (reveal && windowState !== DesktopState.SHOW_DESKTOP)
+                this._releaseEntry(entry);
             onDone();
         };
 
@@ -839,11 +873,12 @@ class MonitorGroup {
 
             // Every window comes back in the same frame, for the reason given
             // on _finishEntry's reveal parameter.
-            for (const entry of entries) {
-                this._applyWindowState(entry.windowActor, windowState);
-                entry.clone.destroy();
-            }
-            this._container.hide();
+            for (const entry of entries)
+                this._releaseEntry(entry);
+            // end() moved these entries out of _entries, so a spread begun
+            // while they were travelling home owns the container now.
+            if (this._entries.length === 0 && this._parked.length === 0)
+                this._container.hide();
         };
 
         for (const entry of entries)
@@ -937,21 +972,48 @@ class MonitorGroup {
      *
      * @param {Function} onClick called when any parked clone is clicked
      */
+    setWindowGoneHandler(onGone) {
+        this._onWindowGone = onGone;
+    }
+
     setParkedClickHandler(onClick) {
         this._onParkedClick = onClick;
     }
 
     abort() {
-        for (const {clone, windowActor} of [...this._entries, ...this._parked]) {
-            clone.remove_all_transitions();
-            clone.destroy();
-            windowActor.show();
+        for (const entry of [...this._entries, ...this._parked]) {
+            entry.clone.remove_all_transitions();
+            this._releaseEntry(entry);
         }
         this._entries = [];
         this._parked = [];
         this._finishing = 0;
         this._container.hide();
     }
+}
+
+/**
+ * Hand the screen back to a window whose actor was hidden behind a clone.
+ *
+ * skipNextEffect is armed only for the unminimize it is meant to silence. The
+ * shell clears it only when it next runs a window effect, and show() runs
+ * none, so arming it for a plain show() left it waiting for the window's next
+ * close, minimize or maximize -- which then happened with no animation.
+ *
+ * A window on another workspace is left hidden: mutter shows its actor again
+ * when that workspace becomes active, and showing it here would draw it over
+ * the workspace that is.
+ *
+ * @param {Meta.WindowActor} windowActor the actor to reveal
+ */
+function revealWindow(windowActor) {
+    const win = windowActor.meta_window;
+    if (win?.minimized) {
+        Main.wm.skipNextEffect(windowActor);
+        win.unminimize();
+    }
+    if (!win || win.located_on_workspace(global.workspace_manager.get_active_workspace()))
+        windowActor.show();
 }
 
 class ShowDesktopGesture {
@@ -995,8 +1057,7 @@ class ShowDesktopGesture {
             );
         }
 
-        for (const monitor of Main.layoutManager.monitors)
-            this._monitorGroups.push(new MonitorGroup(monitor, this._tunables));
+        this._rebuildMonitorGroups();
 
         this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => {
             this._rebuildMonitorGroups();
@@ -1031,9 +1092,6 @@ class ShowDesktopGesture {
             Gio.DBusSignalFlags.NONE,
             () => this.toggle(),
         );
-
-        for (const group of this._monitorGroups)
-            group.setParkedClickHandler(win => this._onCloneClicked(win));
 
         Main.wm.addKeybinding('mission-control-toggle', this._settings,
             Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
@@ -1072,6 +1130,9 @@ class ShowDesktopGesture {
             global.window_manager.connect('destroy', () => {
                 this._windowClosedAt = GLib.get_monotonic_time();
             }),
+            global.window_manager.connect('switch-workspace', () => {
+                this._dropShowDesktop();
+            }),
         ];
 
         // Both gestures, not just the downward one. Watching only that one
@@ -1100,16 +1161,39 @@ class ShowDesktopGesture {
     }
 
     _rebuildMonitorGroups() {
-        if (this._gestureActive)
-            this._cancelActiveGesture(false);
+        this._dropShowDesktop();
         for (const g of this._monitorGroups)
             g.destroy();
         this._monitorGroups = [];
         for (const monitor of Main.layoutManager.monitors) {
             const group = new MonitorGroup(monitor, this._tunables);
             group.setParkedClickHandler(win => this._onCloneClicked(win));
+            group.setWindowGoneHandler(win => this._onParkedWindowGone(win));
             this._monitorGroups.push(group);
         }
+    }
+
+    /**
+     * Put every window back at once, with no animation, and forget that the
+     * desktop was being shown. For when the layout the clones were placed in
+     * no longer exists: the monitors changed, or the workspace did -- the
+     * container sits above the window group on every workspace, so parked
+     * slivers would otherwise stay drawn over the new one.
+     */
+    _dropShowDesktop() {
+        this._cancelActiveGesture(false);
+        for (const group of this._monitorGroups)
+            group.abort();
+        if (this._showingDesktop || this._mode)
+            this._settleAfterGesture(DesktopState.NORMAL);
+    }
+
+    _onParkedWindowGone(win) {
+        this._minimizingWindows =
+            this._minimizingWindows.filter(parked => parked !== win);
+        if (this._showingDesktop && !this._gestureActive &&
+            !this._monitorGroups.some(group => group.hasParked()))
+            this._settleAfterGesture(DesktopState.NORMAL);
     }
 
     destroy() {
@@ -1695,11 +1779,8 @@ class ShowDesktopGesture {
         this._minimizingWindows =
             this._minimizingWindows.filter(parked => parked !== win);
 
-        if (!this._monitorGroups.some(group => group.hasParked())) {
-            this._showingDesktop = false;
-            this._minimizingWindows = [];
-            this._mode = null;
-        }
+        if (!this._monitorGroups.some(group => group.hasParked()))
+            this._settleAfterGesture(DesktopState.NORMAL);
     }
 
     /**
@@ -1808,11 +1889,9 @@ class ShowDesktopGesture {
             return;
 
         const actor = win.get_compositor_private();
-        if (actor) {
-            Main.wm.skipNextEffect(actor);
-            actor.show();
-        }
-        if (win.minimized)
+        if (actor)
+            revealWindow(actor);
+        else if (win.minimized)
             win.unminimize();
     }
 
