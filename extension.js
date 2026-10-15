@@ -21,6 +21,11 @@ const CANCEL_PROGRESS = 0.15;
 const MIN_FINISH_DURATION_MS = 120;
 const SWIPE_MULTIPLIER = 1;
 
+// How near an edge a window has to sit, as a fraction of the room it has to
+// move on that axis, before it will leave by that edge as well as by its
+// nearest one. A third puts the corners at the corner ninths of the screen.
+const CORNER_BAND = 1 / 3;
+
 // macOS pushes each window off whichever screen edge it already sits nearest,
 // at full size and full opacity, and *parks* it there: a sliver stays on
 // screen and the window is never minimized. Clicking a sliver pulls them back.
@@ -559,6 +564,7 @@ class MonitorGroup {
         this._parked = [];
         this._finishing = 0;
         this._onParkedClick = null;
+        this._onWindowGone = null;
     }
 
     destroy() {
@@ -585,10 +591,17 @@ class MonitorGroup {
         if (n === 0)
             return;
 
+        // Within the work area, as parking is: the container sits under the
+        // panel and the dock, so a row laid against the monitor's edge runs
+        // underneath them. The container spans the monitor, hence the offset.
+        const area = Main.layoutManager.getWorkAreaForMonitor(this.monitor.index);
+        const offX = area.x - this.monitor.x;
+        const offY = area.y - this.monitor.y;
+
         const cols = Math.ceil(Math.sqrt(n));
         const rows = Math.ceil(n / cols);
-        const cellW = (this.monitor.width - pad * (cols + 1)) / cols;
-        const cellH = (this.monitor.height - pad * (rows + 1)) / rows;
+        const cellW = (area.width - pad * (cols + 1)) / cols;
+        const cellH = (area.height - pad * (rows + 1)) / rows;
 
         this._entries.forEach((entry, i) => {
             const col = i % cols;
@@ -599,8 +612,8 @@ class MonitorGroup {
             const w = entry.baseW * scale;
             const h = entry.baseH * scale;
             entry.endScale = scale;
-            entry.endX = pad + col * (cellW + pad) + (cellW - w) / 2;
-            entry.endY = pad + row * (cellH + pad) + (cellH - h) / 2;
+            entry.endX = offX + pad + col * (cellW + pad) + (cellW - w) / 2;
+            entry.endY = offY + pad + row * (cellH + pad) + (cellH - h) / 2;
         });
     }
 
@@ -623,44 +636,182 @@ class MonitorGroup {
         const frameW = frame ? frame.width : entry.baseW;
         const frameH = frame ? frame.height : entry.baseH;
 
-        // Three edges, never the bottom: macOS pushes windows off the sides
-        // and the top, and a window sent downwards would travel behind the
-        // dock and read as minimizing rather than parking.
+        // All four edges, and corners, as macOS does: a window leaves by the
+        // edge it already sits nearest, and one sitting near two of them
+        // leaves by both at once.
         //
         // Measured against the work area, not the monitor. A sliver parked at
         // the monitor's top edge sits behind the panel, where it can neither
         // be seen nor clicked to bring its window back -- and the same is true
         // of any side a dock reserves space on. The work area already excludes
         // every such strut.
-        //
-        // Which edge is decided by how far the visible frame already sits from
-        // each one, so a window hugging the top goes up rather than crossing
-        // the whole screen sideways. The top has to be strictly nearer than
-        // both sides to win, which leaves the horizontal case -- including a
-        // maximised window, where every gap is zero -- on the rule it has
-        // always used: whichever half the frame's centre is in.
         const peek = this._tunables.peek;
         const workArea = Main.layoutManager.getWorkAreaForMonitor(this.monitor.index);
         const areaX = workArea.x - this.monitor.x;
         const areaY = workArea.y - this.monitor.y;
         const areaW = workArea.width;
+        const areaH = workArea.height;
 
         const frameX = entry.startX + insetX;
         const frameY = entry.startY + insetY;
         const gapLeft = frameX - areaX;
         const gapRight = areaX + areaW - (frameX + frameW);
         const gapTop = frameY - areaY;
+        const gapBottom = areaY + areaH - (frameY + frameH);
+
+        // Nearness has to be relative to the room the window has to move in,
+        // not an absolute gap, or a wide window would always read as hugging
+        // the sides. Zero room means the window spans the work area on that
+        // axis and has no position on it to speak of, so it is not near
+        // either of those edges -- which is what keeps a maximised or
+        // full-width window from counting as cornered.
+        const roomX = areaW - frameW;
+        const roomY = areaH - frameH;
+        const relH = roomX > 0 ? Math.min(gapLeft, gapRight) / roomX : Infinity;
+        const relV = roomY > 0 ? Math.min(gapTop, gapBottom) / roomY : Infinity;
+
+        // One axis carries the window off the screen, the nearer one. Ties
+        // fall to the horizontal, which is where a centred or maximised
+        // window ends up -- the case this has always sent sideways.
+        const parkH = relH <= relV;
+
+        // A window near two edges is cornered, and goes to that corner by
+        // sliding ALONG its edge to meet it rather than leaving past both.
+        //
+        // Leaving past both is what a diagonal park means, and it hides the
+        // window almost entirely: a rectangle pushed past two edges shows
+        // only where its two slivers overlap, a peek-by-peek square, however
+        // large the window is. Staying inside on the second axis keeps the
+        // whole strip in view -- the window's full height down a side, or its
+        // full width along the top -- so every parked window can still be
+        // read and picked, and the corner reads as a corner anyway.
+        const cornered = Math.max(relH, relV) <= CORNER_BAND;
+
+        entry.park = {
+            insetX, insetY, frameX, frameY, frameW, frameH,
+            gapLeft, gapRight, gapTop, gapBottom, relH, relV,
+            areaX, areaY, areaW, areaH,
+        };
 
         entry.endX = entry.startX;
         entry.endY = entry.startY;
 
-        if (gapTop < gapLeft && gapTop < gapRight) {
-            entry.endY = areaY + peek - insetY - frameH;
-        } else {
-            const centre = frameX + frameW / 2;
-            entry.endX = centre < areaX + areaW / 2
+        if (parkH) {
+            entry.endX = gapLeft <= gapRight
                 ? areaX + peek - insetX - frameW
                 : areaX + areaW - peek - insetX;
+            if (cornered) {
+                entry.endY = gapTop <= gapBottom
+                    ? areaY - insetY
+                    : areaY + areaH - frameH - insetY;
+            }
+        } else {
+            entry.endY = gapTop <= gapBottom
+                ? areaY + peek - insetY - frameH
+                : areaY + areaH - peek - insetY;
+            if (cornered) {
+                entry.endX = gapLeft <= gapRight
+                    ? areaX - insetX
+                    : areaX + areaW - frameW - insetX;
+            }
+        }
+    }
+
+    // Parked strips never stack, as on macOS: each stretch of edge holds one
+    // window. Measured from Sonoma recordings (HANDOVER §18), a window whose
+    // nearest edge is already taken leaves by another, and windows slide a
+    // long way ALONG an edge to make room. Apple's exact rule is unknown; this
+    // reproduces that behaviour with a greedy assignment. Every window prices
+    // each edge as the distance it travels off the screen plus the distance it
+    // has to slide along that edge to a free stretch, and the cheapest
+    // (window, edge) pair is settled first -- so windows already hugging an
+    // edge claim it, and the rest fan out around them.
+    //
+    // A window with no free stretch anywhere keeps _layoutEntry()'s nearest-
+    // edge park, overlap and all, rather than being left on screen.
+    _packEdges() {
+        const peek = this._tunables.peek;
+        const gap = Math.round(peek / 2);
+        const taken = {left: [], right: [], top: [], bottom: []};
+
+        const candidate = (g, edge) => {
+            const horizontal = edge === 'top' || edge === 'bottom';
+            const len = horizontal ? g.frameW : g.frameH;
+            const lo = horizontal ? g.areaX : g.areaY;
+            const hi = (horizontal ? g.areaX + g.areaW : g.areaY + g.areaH) - len;
+            const travel = {
+                left: g.gapLeft + g.frameW,
+                right: g.gapRight + g.frameW,
+                top: g.gapTop + g.frameH,
+                bottom: g.gapBottom + g.frameH,
+            }[edge] - peek;
+
+            // Where it would sit along the edge with nothing in the way: its
+            // own position, or the corner it is already near (§ corners in
+            // _layoutEntry).
+            const alongRel = horizontal ? g.relH : g.relV;
+            const nearStart = horizontal ? g.gapLeft <= g.gapRight : g.gapTop <= g.gapBottom;
+            let pref = horizontal ? g.frameX : g.frameY;
+            if (alongRel <= CORNER_BAND)
+                pref = nearStart ? lo : hi;
+            pref = Math.min(Math.max(pref, lo), Math.max(lo, hi));
+
+            const used = taken[edge];
+            if (hi < lo)  // longer than the edge: only an empty edge will do
+                return used.length ? null : {pos: lo, cost: travel};
+
+            const free = pos => used.every(([a, b]) => pos + len + gap <= a || pos >= b + gap);
+            const tries = [pref];
+            for (const [a, b] of used)
+                tries.push(b + gap, a - gap - len);
+            let pos = null;
+            for (const t of tries) {
+                if (t < lo || t > hi || !free(t))
+                    continue;
+                if (pos === null || Math.abs(t - pref) < Math.abs(pos - pref))
+                    pos = t;
+            }
+            return pos === null ? null : {pos, cost: travel + Math.abs(pos - pref)};
+        };
+
+        // The bottom only when nothing else is free: neither recording ever
+        // parked a window there, with the dock below or beside the screen.
+        const cheapest = (pending, edges) => {
+            let best = null;
+            for (const entry of pending) {
+                for (const edge of edges) {
+                    const c = candidate(entry.park, edge);
+                    if (c && (!best || c.cost < best.cost))
+                        best = {entry, edge, ...c};
+                }
+            }
+            return best;
+        };
+
+        const pending = this._entries.filter(entry => entry.park);
+        while (pending.length) {
+            const best = cheapest(pending, ['left', 'right', 'top']) ??
+                cheapest(pending, ['bottom']);
+            if (!best)
+                break;
+
+            const {entry, edge, pos} = best;
+            const g = entry.park;
+            const horizontal = edge === 'top' || edge === 'bottom';
+            taken[edge].push([pos, pos + (horizontal ? g.frameW : g.frameH)]);
+            pending.splice(pending.indexOf(entry), 1);
+
+            if (horizontal) {
+                entry.endX = pos - g.insetX;
+                entry.endY = edge === 'top'
+                    ? g.areaY + peek - g.insetY - g.frameH
+                    : g.areaY + g.areaH - peek - g.insetY;
+            } else {
+                entry.endY = pos - g.insetY;
+                entry.endX = edge === 'left'
+                    ? g.areaX + peek - g.insetX - g.frameW
+                    : g.areaX + g.areaW - peek - g.insetX;
+            }
         }
     }
 
@@ -675,12 +826,13 @@ class MonitorGroup {
             });
             clone.set_pivot_point(0, 0);
             clone.reactive = true;
+            const entry = {clone, windowActor};
+            entry.destroyId = windowActor.connect('destroy', () => this._forgetEntry(entry));
             clone.connect('button-press-event', () => {
                 this._onParkedClick?.(windowActor.meta_window);
                 return Clutter.EVENT_STOP;
             });
             windowActor.hide();
-            const entry = {clone, windowActor};
             this._layoutEntry(entry);
             this._entries.push(entry);
             // Window actors arrive bottom to top, so each clone goes on top of
@@ -691,6 +843,8 @@ class MonitorGroup {
 
         if (this._layout === 'grid')
             this._layoutGrid();
+        else
+            this._packEdges();
 
         if (this._entries.length > 0)
             this._container.show();
@@ -716,16 +870,41 @@ class MonitorGroup {
         this._applyProgress(progress);
     }
 
-    // Only ever reached with NORMAL: a parked entry keeps its clone and never
-    // gets here. Windows are hidden rather than minimized, so the only thing
-    // to undo is the hiding -- plus an unminimize for a window some other path
-    // minimized while it was parked.
-    _applyWindowState(windowActor, desktopState) {
-        const win = windowActor.meta_window;
-        Main.wm.skipNextEffect(windowActor);
-        if (win?.minimized)
-            win.unminimize();
-        windowActor.show();
+    /**
+     * Retire an entry: drop its clone and give the screen back to the window.
+     * Windows are hidden rather than minimized, so the only thing to undo is
+     * the hiding, plus an unminimize for a window some other path minimized
+     * while it was parked. An entry whose window has closed has already been
+     * torn down by its destroy handler.
+     *
+     * @param entry - the clone and window to release
+     */
+    _releaseEntry(entry) {
+        if (entry.gone)
+            return;
+        entry.gone = true;
+        entry.windowActor.disconnect(entry.destroyId);
+        entry.clone.destroy();
+        revealWindow(entry.windowActor);
+    }
+
+    /**
+     * A window closed while one of our clones stood in for it. Drop the entry
+     * outright: its actor is being disposed, and leaving it would keep a
+     * zero-size "parked" window that makes the next desktop click a dead
+     * restore, and a later show() on the dead actor could throw part way
+     * through revealing the others.
+     *
+     * @param entry - the entry whose window closed
+     */
+    _forgetEntry(entry) {
+        entry.gone = true;
+        this._entries = this._entries.filter(e => e !== entry);
+        this._parked = this._parked.filter(e => e !== entry);
+        entry.clone.destroy();
+        if (this._entries.length === 0 && this._parked.length === 0 && this._finishing <= 0)
+            this._container.hide();
+        this._onWindowGone?.(entry.windowActor.meta_window);
     }
 
     /**
@@ -741,7 +920,7 @@ class MonitorGroup {
      * @param onDone - called once this entry has settled
      */
     _finishEntry(entry, progress, duration, windowState, reveal, onDone) {
-        const {clone, windowActor} = entry;
+        const {clone} = entry;
         const p = progressToUnit(progress);
         const targetX = lerp(entry.startX, entry.endX, p);
         const targetY = lerp(entry.startY, entry.endY, p);
@@ -750,14 +929,14 @@ class MonitorGroup {
         clone.remove_all_transitions();
 
         const finalize = () => {
-            this._finishing -= 1;
+            // Clamped: abort() zeroes the count while an end() it cannot see
+            // may still have entries in flight, and those finish later.
+            this._finishing = Math.max(0, this._finishing - 1);
             // Parked entries keep their clone: it stands in for the window at
             // the edge, whose actor stays hidden. macOS leaves the windows
             // there rather than minimizing them away.
-            if (reveal && windowState !== DesktopState.SHOW_DESKTOP) {
-                this._applyWindowState(windowActor, windowState);
-                clone.destroy();
-            }
+            if (reveal && windowState !== DesktopState.SHOW_DESKTOP)
+                this._releaseEntry(entry);
             onDone();
         };
 
@@ -800,11 +979,12 @@ class MonitorGroup {
 
             // Every window comes back in the same frame, for the reason given
             // on _finishEntry's reveal parameter.
-            for (const entry of entries) {
-                this._applyWindowState(entry.windowActor, windowState);
-                entry.clone.destroy();
-            }
-            this._container.hide();
+            for (const entry of entries)
+                this._releaseEntry(entry);
+            // end() moved these entries out of _entries, so a spread begun
+            // while they were travelling home owns the container now.
+            if (this._entries.length === 0 && this._parked.length === 0)
+                this._container.hide();
         };
 
         for (const entry of entries)
@@ -898,21 +1078,48 @@ class MonitorGroup {
      *
      * @param {Function} onClick called when any parked clone is clicked
      */
+    setWindowGoneHandler(onGone) {
+        this._onWindowGone = onGone;
+    }
+
     setParkedClickHandler(onClick) {
         this._onParkedClick = onClick;
     }
 
     abort() {
-        for (const {clone, windowActor} of [...this._entries, ...this._parked]) {
-            clone.remove_all_transitions();
-            clone.destroy();
-            windowActor.show();
+        for (const entry of [...this._entries, ...this._parked]) {
+            entry.clone.remove_all_transitions();
+            this._releaseEntry(entry);
         }
         this._entries = [];
         this._parked = [];
         this._finishing = 0;
         this._container.hide();
     }
+}
+
+/**
+ * Hand the screen back to a window whose actor was hidden behind a clone.
+ *
+ * skipNextEffect is armed only for the unminimize it is meant to silence. The
+ * shell clears it only when it next runs a window effect, and show() runs
+ * none, so arming it for a plain show() left it waiting for the window's next
+ * close, minimize or maximize -- which then happened with no animation.
+ *
+ * A window on another workspace is left hidden: mutter shows its actor again
+ * when that workspace becomes active, and showing it here would draw it over
+ * the workspace that is.
+ *
+ * @param {Meta.WindowActor} windowActor the actor to reveal
+ */
+function revealWindow(windowActor) {
+    const win = windowActor.meta_window;
+    if (win?.minimized) {
+        Main.wm.skipNextEffect(windowActor);
+        win.unminimize();
+    }
+    if (!win || win.located_on_workspace(global.workspace_manager.get_active_workspace()))
+        windowActor.show();
 }
 
 class ShowDesktopGesture {
@@ -936,9 +1143,6 @@ class ShowDesktopGesture {
         // does the opposite of what the gesture was doing whatever the windows
         // happen to be in the middle of.
         this._gestureDirection = null;
-        // Which swipe direction raised the current spread, so the opposite
-        // one can put it back. Null when it was raised some other way.
-        this._openedBy = null;
         this._restoreSwipe = 0;
         this._restoreHandlers = [];
         this._swipeDistance = primarySwipeDistance();
@@ -959,8 +1163,7 @@ class ShowDesktopGesture {
             );
         }
 
-        for (const monitor of Main.layoutManager.monitors)
-            this._monitorGroups.push(new MonitorGroup(monitor, this._tunables));
+        this._rebuildMonitorGroups();
 
         this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => {
             this._rebuildMonitorGroups();
@@ -996,12 +1199,13 @@ class ShowDesktopGesture {
             () => this.toggle(),
         );
 
-        for (const group of this._monitorGroups)
-            group.setParkedClickHandler(win => this._onCloneClicked(win));
-
         Main.wm.addKeybinding('mission-control-toggle', this._settings,
             Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
-            () => this.toggleMissionControl());
+            () => this.toggleSpread('mission'));
+
+        Main.wm.addKeybinding('app-expose-toggle', this._settings,
+            Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this.toggleSpread('expose'));
 
         // The same toggle the gestures and DING's desktop click reach, so the
         // keyboard is one more way in rather than a second code path.
@@ -1015,7 +1219,7 @@ class ShowDesktopGesture {
                 return Clutter.EVENT_PROPAGATE;
             if (event.get_key_symbol() !== Clutter.KEY_Escape)
                 return Clutter.EVENT_PROPAGATE;
-            this.hideMissionControl(null);
+            this.hideSpread(null);
             return Clutter.EVENT_STOP;
         });
 
@@ -1032,15 +1236,16 @@ class ShowDesktopGesture {
             global.window_manager.connect('destroy', () => {
                 this._windowClosedAt = GLib.get_monotonic_time();
             }),
+            global.window_manager.connect('switch-workspace', () => {
+                this._dropShowDesktop();
+            }),
         ];
 
-        // Both directions, not just down. Watching only the downward gesture
-        // meant a downward swipe was the sole way to dismiss anything,
-        // whatever had raised it: an upward swipe could not put back what it
-        // had opened, and Mission Control answered to the wrong direction.
+        // Both gestures, not just the downward one. Watching only that one
+        // meant a downward swipe was the sole way to dismiss anything, so an
+        // upward swipe could not put back what it had itself opened.
         this._restoreHandlers = [];
-        for (const [tracker, direction] of
-            [[this._swipeDown, 'down'], [this._swipeUp, 'up']]) {
+        for (const tracker of [this._swipeDown, this._swipeUp]) {
             const gesture = tracker._touchpadGesture;
             this._restoreHandlers.push(
                 [gesture, gesture.connect('begin', () => {
@@ -1056,27 +1261,51 @@ class ShowDesktopGesture {
                         this._restoreSwipe += delta;
                 })],
                 [gesture, gesture.connect('end',
-                    () => this._onSwipeEndForRestore(direction))],
+                    () => this._onSwipeEndForRestore())],
             );
         }
     }
 
     _rebuildMonitorGroups() {
-        if (this._gestureActive)
-            this._cancelActiveGesture(false);
+        this._dropShowDesktop();
         for (const g of this._monitorGroups)
             g.destroy();
         this._monitorGroups = [];
         for (const monitor of Main.layoutManager.monitors) {
             const group = new MonitorGroup(monitor, this._tunables);
             group.setParkedClickHandler(win => this._onCloneClicked(win));
+            group.setWindowGoneHandler(win => this._onParkedWindowGone(win));
             this._monitorGroups.push(group);
         }
+    }
+
+    /**
+     * Put every window back at once, with no animation, and forget that the
+     * desktop was being shown. For when the layout the clones were placed in
+     * no longer exists: the monitors changed, or the workspace did -- the
+     * container sits above the window group on every workspace, so parked
+     * slivers would otherwise stay drawn over the new one.
+     */
+    _dropShowDesktop() {
+        this._cancelActiveGesture(false);
+        for (const group of this._monitorGroups)
+            group.abort();
+        if (this._showingDesktop || this._mode)
+            this._settleAfterGesture(DesktopState.NORMAL);
+    }
+
+    _onParkedWindowGone(win) {
+        this._minimizingWindows =
+            this._minimizingWindows.filter(parked => parked !== win);
+        if (this._showingDesktop && !this._gestureActive &&
+            !this._monitorGroups.some(group => group.hasParked()))
+            this._settleAfterGesture(DesktopState.NORMAL);
     }
 
     destroy() {
         this.resetShowDesktop();
         Main.wm.removeKeybinding('mission-control-toggle');
+        Main.wm.removeKeybinding('app-expose-toggle');
         Main.wm.removeKeybinding('show-desktop-toggle');
         if (this._stageKeyId) {
             global.stage.disconnect(this._stageKeyId);
@@ -1180,47 +1409,24 @@ class ShowDesktopGesture {
     }
 
     /**
-     * @param {string} direction the direction of the swipe that just ended
+     * A spread is put back by the next vertical swipe that travels far
+     * enough, in either direction: the counteraction of whatever raised it,
+     * or the same gesture repeated.
+     *
+     * Requiring the counteraction alone was tried and is worse to use. It
+     * means remembering which direction opened the thing you are looking at
+     * in order to close it, and it leaves the other direction doing nothing
+     * at all -- which reads as the gesture having failed rather than as the
+     * gesture being the wrong one.
      */
-    _onSwipeEndForRestore(direction) {
+    _onSwipeEndForRestore() {
         const travelled = this._restoreSwipe;
         this._restoreSwipe = 0;
 
         if (!this._showingDesktop || this._gestureActive)
             return;
-        if (travelled < ACTIVATION_DOWN_PX)
-            return;
-        if (this._dismissesSpread(direction))
+        if (travelled >= ACTIVATION_DOWN_PX)
             this._restoreAll();
-    }
-
-    /**
-     * Whether a swipe in this direction puts the current spread back.
-     *
-     * The counteraction of whatever raised it, normally: up closes what a
-     * downward swipe opened, and down closes what an upward one did.
-     *
-     * When the counter direction has no gesture of its own there is nothing
-     * to pair with, so the raising direction repeated dismisses instead --
-     * which is what the defaults do, and what this is on top of. Raised some
-     * other way, by the keyboard, a desktop click or the pinch, there is no
-     * opening swipe to answer, so downward dismisses as it always has.
-     *
-     * @param {string} direction the direction of the swipe that just ended
-     * @returns {boolean} whether it should restore
-     */
-    _dismissesSpread(direction) {
-        if (this._openedBy === null)
-            return direction === 'down';
-
-        const counter = this._openedBy === 'down' ? 'up' : 'down';
-        if (direction === counter)
-            return true;
-
-        const counterAction = counter === 'up'
-            ? this._tunables.swipeUpAction
-            : this._tunables.swipeDownAction;
-        return counterAction === 'none';
     }
 
     /**
@@ -1275,8 +1481,6 @@ class ShowDesktopGesture {
             return;
         }
 
-        // Recorded after _beginGesture, which clears it.
-        this._openedBy = direction;
         this._gestureActive = true;
     }
 
@@ -1530,9 +1734,6 @@ class ShowDesktopGesture {
         if (groups.length === 0)
             return false;
 
-        // Cleared here so a spread raised by the keyboard or a click does not
-        // inherit the direction of whatever swipe came before it.
-        this._openedBy = null;
         this._minimizingWindows = windows;
         for (const {group, actors} of groups) {
             group.setLayout(layout);
@@ -1614,13 +1815,42 @@ class ShowDesktopGesture {
             return;
 
         const focused = global.display.focus_window;
-        if (!focused || !this._minimizingWindows.includes(focused))
+        if (!focused)
             return;
 
-        // Focus landing on a parked window right after a close is the stack
-        // falling through, not the user asking for that window. Hand focus to
-        // the desktop and leave everything parked, the way macOS does.
-        if (GLib.get_monotonic_time() - this._windowClosedAt < CLOSE_FALLBACK_US) {
+        // Focus arriving right after a close is the stack falling through,
+        // not the user asking for that window.
+        const settlingAfterClose =
+            GLib.get_monotonic_time() - this._windowClosedAt < CLOSE_FALLBACK_US;
+
+        // A spread ends as soon as any window takes the focus: picked from
+        // the dock, reached by Alt+Tab, or freshly launched. That means the
+        // same thing as clicking its tile, so it goes through the same path.
+        //
+        // Membership of _minimizingWindows is deliberately NOT required here.
+        // A window that has just started did not exist when the spread began,
+        // so it is not in that list, and testing it first left the grid
+        // sitting on top of the application that had only just opened.
+        //
+        // No recursion: hideSpread activates the window, but it is already
+        // the focus window here, so the property does not change and this
+        // does not run again.
+        if (this._isGridMode()) {
+            // Closing a window while the grid is up leaves the grid up, as
+            // macOS does -- the focus moved on its own, nothing was picked.
+            if (!settlingAfterClose)
+                this.hideSpread(focused);
+            return;
+        }
+
+        // Parked windows only, below: the desktop is showing, and a window
+        // that was never parked has nothing to come back from.
+        if (!this._minimizingWindows.includes(focused))
+            return;
+
+        // Hand focus to the desktop and leave everything parked, the way
+        // macOS does.
+        if (settlingAfterClose) {
             this._focusDesktop();
             return;
         }
@@ -1655,11 +1885,8 @@ class ShowDesktopGesture {
         this._minimizingWindows =
             this._minimizingWindows.filter(parked => parked !== win);
 
-        if (!this._monitorGroups.some(group => group.hasParked())) {
-            this._showingDesktop = false;
-            this._minimizingWindows = [];
-            this._mode = null;
-        }
+        if (!this._monitorGroups.some(group => group.hasParked()))
+            this._settleAfterGesture(DesktopState.NORMAL);
     }
 
     /**
@@ -1676,14 +1903,23 @@ class ShowDesktopGesture {
         return this._mode === 'mission' || this._mode === 'expose';
     }
 
-    showMissionControl(duration = null) {
+    /**
+     * Spread the windows out without a gesture, for the keyboard.
+     *
+     * @param {string} mode 'mission' for every window on the workspace,
+     *   'expose' for the focused application's only
+     * @param {number|null} duration animation length in ms, or the default
+     */
+    showSpread(mode = 'mission', duration = null) {
         if (this._showingDesktop || this._gestureActive || !isDesktopMode())
             return;
 
         if (!this._beginGesture({
             layout: 'grid',
-            windows: this._collectWindows(),
-            mode: 'mission',
+            windows: mode === 'expose'
+                ? this._collectAppWindows()
+                : this._collectWindows(),
+            mode,
         }))
             return;
 
@@ -1700,7 +1936,7 @@ class ShowDesktopGesture {
      *
      * @param {Meta.Window|null} win the window to raise, if any
      */
-    hideMissionControl(win) {
+    hideSpread(win) {
         if (!this._isGridMode())
             return;
 
@@ -1725,19 +1961,22 @@ class ShowDesktopGesture {
         this.restoreDesktop(this._tunables.duration);
     }
 
-    toggleMissionControl() {
-        // Any spread, not just this one: with App Expose up, showMissionControl
-        // would bail on its own showingDesktop guard and the key would do
-        // nothing at all.
+    /**
+     * @param {string} mode which spread the key asks for, when none is up
+     */
+    toggleSpread(mode = 'mission') {
+        // Any spread, not just the one this key opens: with App Expose up,
+        // showSpread would bail on its own showingDesktop guard and
+        // Control+Up would do nothing at all.
         if (this._isGridMode())
-            this.hideMissionControl(null);
+            this.hideSpread(null);
         else
-            this.showMissionControl();
+            this.showSpread(mode);
     }
 
     _onCloneClicked(win) {
         if (this._isGridMode())
-            this.hideMissionControl(win);
+            this.hideSpread(win);
         else
             this.restoreDesktop();
     }
@@ -1756,11 +1995,9 @@ class ShowDesktopGesture {
             return;
 
         const actor = win.get_compositor_private();
-        if (actor) {
-            Main.wm.skipNextEffect(actor);
-            actor.show();
-        }
-        if (win.minimized)
+        if (actor)
+            revealWindow(actor);
+        else if (win.minimized)
             win.unminimize();
     }
 
@@ -1784,11 +2021,13 @@ export default class ThreeFingerShowDesktopExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
         this._suppressStartupOverview();
+        this._restrictPanelDrag();
         this._gesture = new ShowDesktopGesture(this._settings);
     }
 
     disable() {
         this._restoreStartupOverview();
+        this._releasePanelDrag();
         this._gesture?.resetShowDesktop();
         this._gesture?.destroy();
         this._gesture = null;
@@ -1836,6 +2075,42 @@ export default class ThreeFingerShowDesktopExtension extends Extension {
 
         this._startupCompleteId = Main.layoutManager.connect('startup-complete',
             () => this._restoreStartupOverview());
+    }
+
+    /**
+     * Let only a primary click on the panel drag the window beneath it.
+     *
+     * The panel drags whatever maximised window sits under the pointer, which
+     * is a feature -- but it answers to every button. `Clutter.ClickGesture`
+     * takes a `required-button`, and 0, its default, means any button; the
+     * shell constructs the panel's gesture without setting it, so a right- or
+     * middle-click on the panel grabs the window instead of doing nothing.
+     * The `button-press-event` path it replaced tested for
+     * `Clutter.BUTTON_PRIMARY`, so this is a regression rather than a choice.
+     *
+     * A property, not a patched method: the gesture object is the shell's, and
+     * the old value goes back on disable.
+     */
+    _restrictPanelDrag() {
+        if (!this._settings.get_boolean('panel-drag-primary-only'))
+            return;
+
+        const gesture = Main.panel._clickGesture;
+        if (!gesture || gesture.required_button === undefined)
+            return;
+
+        this._origPanelDragButton = gesture.required_button;
+        gesture.required_button = Clutter.BUTTON_PRIMARY;
+    }
+
+    _releasePanelDrag() {
+        if (this._origPanelDragButton === undefined)
+            return;
+
+        const gesture = Main.panel._clickGesture;
+        if (gesture)
+            gesture.required_button = this._origPanelDragButton;
+        this._origPanelDragButton = undefined;
     }
 
     _restoreStartupOverview() {

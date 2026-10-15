@@ -55,6 +55,11 @@
       <summary>Swallow vertical swipes with a different finger count</summary>
       <description>GNOME's overview answers to any vertical swipe of three or more fingers, so raising swipe-finger-count leaves the lower counts still opening it. This consumes those. Horizontal swipes are never touched, so switching workspaces keeps working.</description>
     </key>
+    <key name="panel-drag-primary-only" type="b">
+      <default>false</default>
+      <summary>Only a left click on the panel drags the window below</summary>
+      <description>The top panel drags whatever maximised window sits under the pointer. The shell's gesture answers to every button, so a right or middle click grabs the window too. Turning this on limits it to the primary button, which is what the code it replaced did. Off by default, matching the shell as it ships.</description>
+    </key>
     <key name="suppress-startup-overview" type="b">
       <default>false</default>
       <summary>Keep the stock overview off the screen at login</summary>
@@ -93,6 +98,11 @@
       <default><![CDATA[['<Control><Super>Up']]]></default>
       <summary>Show every window</summary>
       <description>Spread the windows of the current workspace out to be picked from, the way Mission Control does. macOS uses Control+Up for this.</description>
+    </key>
+    <key name="app-expose-toggle" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Show this application's windows</summary>
+      <description>Spread out the windows of the focused application only, the way App Expose does, and put them back when pressed again. Empty by default, as upstream binds nothing here. macOS uses Control+Down.</description>
     </key>
     <key name="show-desktop-toggle" type="as">
       <default><![CDATA[['<Control><Super>Up', '<Super>d']]]></default>
