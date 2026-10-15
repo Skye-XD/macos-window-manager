@@ -864,6 +864,10 @@ class MonitorGroup {
         }
     }
 
+    get animating() {
+        return this._finishing > 0;
+    }
+
     update(progress) {
         if (this._finishing > 0)
             return;
@@ -1196,7 +1200,7 @@ class ShowDesktopGesture {
             null,
             null,
             Gio.DBusSignalFlags.NONE,
-            () => this.toggle(),
+            () => this._onDesktopClick(),
         );
 
         Main.wm.addKeybinding('mission-control-toggle', this._settings,
@@ -1979,6 +1983,29 @@ class ShowDesktopGesture {
             this.hideSpread(win);
         else
             this.restoreDesktop();
+    }
+
+    /**
+     * DING's report of a click on bare desktop, filtered for two clicks it
+     * sees that were never meant for the desktop.
+     *
+     * DING knows only its own window. A press on shell chrome drawn over the
+     * desktop that let the click through -- NexStage's stage strip did -- reads
+     * to it as a desktop click; so does a click aimed at a window in flight,
+     * because the real window is hidden while its clone animates, and the
+     * desktop is what lies under it. Either toggled Show Desktop, and the
+     * second toggled it straight back: the window blinked away and returned.
+     */
+    _onDesktopClick() {
+        if (this._monitorGroups.some(group => group.animating))
+            return;
+
+        const [x, y] = global.get_pointer();
+        const actor = global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, x, y);
+        if (actor && actor !== global.stage && !global.window_group.contains(actor))
+            return;
+
+        this.toggle();
     }
 
     toggle() {
