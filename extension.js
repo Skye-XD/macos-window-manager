@@ -687,6 +687,12 @@ class MonitorGroup {
         // read and picked, and the corner reads as a corner anyway.
         const cornered = Math.max(relH, relV) <= CORNER_BAND;
 
+        entry.park = {
+            insetX, insetY, frameX, frameY, frameW, frameH,
+            gapLeft, gapRight, gapTop, gapBottom, relH, relV,
+            areaX, areaY, areaW, areaH,
+        };
+
         entry.endX = entry.startX;
         entry.endY = entry.startY;
 
@@ -707,6 +713,104 @@ class MonitorGroup {
                 entry.endX = gapLeft <= gapRight
                     ? areaX - insetX
                     : areaX + areaW - frameW - insetX;
+            }
+        }
+    }
+
+    // Parked strips never stack, as on macOS: each stretch of edge holds one
+    // window. Measured from Sonoma recordings (HANDOVER §18), a window whose
+    // nearest edge is already taken leaves by another, and windows slide a
+    // long way ALONG an edge to make room. Apple's exact rule is unknown; this
+    // reproduces that behaviour with a greedy assignment. Every window prices
+    // each edge as the distance it travels off the screen plus the distance it
+    // has to slide along that edge to a free stretch, and the cheapest
+    // (window, edge) pair is settled first -- so windows already hugging an
+    // edge claim it, and the rest fan out around them.
+    //
+    // A window with no free stretch anywhere keeps _layoutEntry()'s nearest-
+    // edge park, overlap and all, rather than being left on screen.
+    _packEdges() {
+        const peek = this._tunables.peek;
+        const gap = Math.round(peek / 2);
+        const taken = {left: [], right: [], top: [], bottom: []};
+
+        const candidate = (g, edge) => {
+            const horizontal = edge === 'top' || edge === 'bottom';
+            const len = horizontal ? g.frameW : g.frameH;
+            const lo = horizontal ? g.areaX : g.areaY;
+            const hi = (horizontal ? g.areaX + g.areaW : g.areaY + g.areaH) - len;
+            const travel = {
+                left: g.gapLeft + g.frameW,
+                right: g.gapRight + g.frameW,
+                top: g.gapTop + g.frameH,
+                bottom: g.gapBottom + g.frameH,
+            }[edge] - peek;
+
+            // Where it would sit along the edge with nothing in the way: its
+            // own position, or the corner it is already near (§ corners in
+            // _layoutEntry).
+            const alongRel = horizontal ? g.relH : g.relV;
+            const nearStart = horizontal ? g.gapLeft <= g.gapRight : g.gapTop <= g.gapBottom;
+            let pref = horizontal ? g.frameX : g.frameY;
+            if (alongRel <= CORNER_BAND)
+                pref = nearStart ? lo : hi;
+            pref = Math.min(Math.max(pref, lo), Math.max(lo, hi));
+
+            const used = taken[edge];
+            if (hi < lo)  // longer than the edge: only an empty edge will do
+                return used.length ? null : {pos: lo, cost: travel};
+
+            const free = pos => used.every(([a, b]) => pos + len + gap <= a || pos >= b + gap);
+            const tries = [pref];
+            for (const [a, b] of used)
+                tries.push(b + gap, a - gap - len);
+            let pos = null;
+            for (const t of tries) {
+                if (t < lo || t > hi || !free(t))
+                    continue;
+                if (pos === null || Math.abs(t - pref) < Math.abs(pos - pref))
+                    pos = t;
+            }
+            return pos === null ? null : {pos, cost: travel + Math.abs(pos - pref)};
+        };
+
+        // The bottom only when nothing else is free: neither recording ever
+        // parked a window there, with the dock below or beside the screen.
+        const cheapest = (pending, edges) => {
+            let best = null;
+            for (const entry of pending) {
+                for (const edge of edges) {
+                    const c = candidate(entry.park, edge);
+                    if (c && (!best || c.cost < best.cost))
+                        best = {entry, edge, ...c};
+                }
+            }
+            return best;
+        };
+
+        const pending = this._entries.filter(entry => entry.park);
+        while (pending.length) {
+            const best = cheapest(pending, ['left', 'right', 'top']) ??
+                cheapest(pending, ['bottom']);
+            if (!best)
+                break;
+
+            const {entry, edge, pos} = best;
+            const g = entry.park;
+            const horizontal = edge === 'top' || edge === 'bottom';
+            taken[edge].push([pos, pos + (horizontal ? g.frameW : g.frameH)]);
+            pending.splice(pending.indexOf(entry), 1);
+
+            if (horizontal) {
+                entry.endX = pos - g.insetX;
+                entry.endY = edge === 'top'
+                    ? g.areaY + peek - g.insetY - g.frameH
+                    : g.areaY + g.areaH - peek - g.insetY;
+            } else {
+                entry.endY = pos - g.insetY;
+                entry.endX = edge === 'left'
+                    ? g.areaX + peek - g.insetX - g.frameW
+                    : g.areaX + g.areaW - peek - g.insetX;
             }
         }
     }
@@ -739,6 +843,8 @@ class MonitorGroup {
 
         if (this._layout === 'grid')
             this._layoutGrid();
+        else
+            this._packEdges();
 
         if (this._entries.length > 0)
             this._container.show();
