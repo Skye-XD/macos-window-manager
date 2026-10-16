@@ -562,6 +562,10 @@ class MonitorGroup {
         );
         this._entries = [];
         this._parked = [];
+        // Entries travelling home, owned here until their windows are
+        // revealed, so abort() and destroy() can finish them and a new spread
+        // can take their windows back instead of missing them.
+        this._restoring = [];
         this._finishing = 0;
         this._onParkedClick = null;
         this._onWindowGone = null;
@@ -905,9 +909,9 @@ class MonitorGroup {
         entry.gone = true;
         this._entries = this._entries.filter(e => e !== entry);
         this._parked = this._parked.filter(e => e !== entry);
+        this._restoring = this._restoring.filter(e => e !== entry);
         entry.clone.destroy();
-        if (this._entries.length === 0 && this._parked.length === 0 && this._finishing <= 0)
-            this._container.hide();
+        this._hideIfIdle();
         this._onWindowGone?.(entry.windowActor.meta_window);
     }
 
@@ -933,8 +937,8 @@ class MonitorGroup {
         clone.remove_all_transitions();
 
         const finalize = () => {
-            // Clamped: abort() zeroes the count while an end() it cannot see
-            // may still have entries in flight, and those finish later.
+            // Clamped: resume() zeroes the count while entries it did not
+            // take over may still be in flight, and those finish later.
             this._finishing = Math.max(0, this._finishing - 1);
             // Parked entries keep their clone: it stands in for the window at
             // the edge, whose actor stays hidden. macOS leaves the windows
@@ -965,9 +969,31 @@ class MonitorGroup {
         });
     }
 
+    /**
+     * Hide the container once nothing is left on it -- not merely nothing
+     * live, or a restore still in flight would lose its clones while its
+     * windows are still hidden.
+     */
+    _hideIfIdle() {
+        if (this._entries.length === 0 && this._parked.length === 0 &&
+            this._restoring.length === 0)
+            this._container.hide();
+    }
+
+    /**
+     * Whether this window is on its way home behind a clone. Its actor is
+     * still hidden, so a spread collecting by visibility would miss it.
+     *
+     * @param {Meta.WindowActor} windowActor the actor to test
+     * @returns {boolean} true while a restore owns it
+     */
+    isRestoring(windowActor) {
+        return this._restoring.some(e => e.windowActor === windowActor);
+    }
+
     end(progress, duration, windowState = progress) {
         if (this._entries.length === 0) {
-            this._container.hide();
+            this._hideIfIdle();
             return;
         }
 
@@ -975,6 +1001,8 @@ class MonitorGroup {
         this._entries = [];
         const parking = windowState === DesktopState.SHOW_DESKTOP;
         let remaining = entries.length;
+        if (!parking)
+            this._restoring.push(...entries);
 
         const done = () => {
             remaining -= 1;
@@ -983,12 +1011,10 @@ class MonitorGroup {
 
             // Every window comes back in the same frame, for the reason given
             // on _finishEntry's reveal parameter.
+            this._restoring = this._restoring.filter(e => !entries.includes(e));
             for (const entry of entries)
                 this._releaseEntry(entry);
-            // end() moved these entries out of _entries, so a spread begun
-            // while they were travelling home owns the container now.
-            if (this._entries.length === 0 && this._parked.length === 0)
-                this._container.hide();
+            this._hideIfIdle();
         };
 
         for (const entry of entries)
@@ -1050,9 +1076,10 @@ class MonitorGroup {
             return false;
 
         const [entry] = this._parked.splice(index, 1);
+        this._restoring.push(entry);
         this._finishEntry(entry, 0, duration, DesktopState.NORMAL, true, () => {
-            if (this._parked.length === 0 && this._entries.length === 0)
-                this._container.hide();
+            this._restoring = this._restoring.filter(e => e !== entry);
+            this._hideIfIdle();
         });
         return true;
     }
@@ -1069,7 +1096,8 @@ class MonitorGroup {
      * @returns {boolean} whether that window is parked here
      */
     raiseCloneFor(win) {
-        const entry = this._parked.find(
+        // Live entries too: a pinch dragging the grid home has resumed them.
+        const entry = [...this._entries, ...this._parked].find(
             e => e.windowActor.meta_window === win);
         if (!entry)
             return false;
@@ -1090,13 +1118,19 @@ class MonitorGroup {
         this._onParkedClick = onClick;
     }
 
+    /**
+     * Put every window back now. Restores in flight are finished too:
+     * stopping a clone's transition runs its completion, which releases the
+     * entry, and _releaseEntry ignores one already released.
+     */
     abort() {
-        for (const entry of [...this._entries, ...this._parked]) {
+        for (const entry of [...this._entries, ...this._parked, ...this._restoring]) {
             entry.clone.remove_all_transitions();
             this._releaseEntry(entry);
         }
         this._entries = [];
         this._parked = [];
+        this._restoring = [];
         this._finishing = 0;
         this._container.hide();
     }
@@ -1203,19 +1237,27 @@ class ShowDesktopGesture {
             () => this._onDesktopClick(),
         );
 
+        // Held keys must not autorepeat a toggle open and shut, which is why
+        // the shell's own toggles ignore autorepeat as well.
         Main.wm.addKeybinding('mission-control-toggle', this._settings,
-            Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT, Shell.ActionMode.NORMAL,
             () => this.toggleSpread('mission'));
 
         Main.wm.addKeybinding('app-expose-toggle', this._settings,
-            Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT, Shell.ActionMode.NORMAL,
             () => this.toggleSpread('expose'));
 
         // The same toggle the gestures and DING's desktop click reach, so the
         // keyboard is one more way in rather than a second code path.
         Main.wm.addKeybinding('show-desktop-toggle', this._settings,
-            Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT, Shell.ActionMode.NORMAL,
             () => this.toggle());
+
+        // Takes the keyboard while a grid is up; see _syncKeyFocus. Never
+        // shown or sized, but it has to stay mapped: Clutter drops the key
+        // focus of an actor that is unmapped.
+        this._keySink = new Clutter.Actor();
+        Main.layoutManager.uiGroup.add_child(this._keySink);
 
         this._stageKeyId = global.stage.connect('captured-event::key', (_actor, event) => {
             if (!this._isGridMode() ||
@@ -1315,6 +1357,8 @@ class ShowDesktopGesture {
             global.stage.disconnect(this._stageKeyId);
             this._stageKeyId = 0;
         }
+        this._keySink?.destroy();
+        this._keySink = null;
         for (const id of this._displayHandlers)
             global.display.disconnect(id);
         this._displayHandlers = [];
@@ -1359,8 +1403,14 @@ class ShowDesktopGesture {
 
     _collectWindows() {
         const workspace = global.workspace_manager.get_active_workspace();
+        // A window still travelling home from the last restore has its actor
+        // hidden until the last clone lands. It is taken all the same, and
+        // MonitorGroup.begin() finishes that restore before cloning it --
+        // otherwise a spread begun mid-restore left it out, and it surfaced
+        // behind the grid where it could not be picked.
         return global.get_window_actors()
-            .filter(a => a.visible)
+            .filter(a => a.visible ||
+                this._monitorGroups.some(g => g.isRestoring(a)))
             .map(a => a.meta_window)
             .filter(win =>
                 win &&
@@ -1706,6 +1756,7 @@ class ShowDesktopGesture {
             // into the grid, and is still Mission Control.
             this._mode ??= 'desktop';
             this._parkedAt = GLib.get_monotonic_time();
+            this._syncKeyFocus();
             return;
         }
 
@@ -1716,6 +1767,31 @@ class ShowDesktopGesture {
         for (const group of this._monitorGroups)
             group.setLayout('edge');
         this._minimizingWindows = [];
+        this._syncKeyFocus();
+    }
+
+    /**
+     * Hold the keyboard while a grid is up, and only then.
+     *
+     * The focused window stays focused under the grid, hidden, and would
+     * otherwise get every key but Escape -- Enter could send a half-typed
+     * message. A stage handler cannot stop that: mutter hands keys to the
+     * focused client before Clutter sees them, unless the stage's key focus
+     * is set (events.c, stage_has_key_focus), as for keyboard navigation in
+     * the panel. So the grid takes it. Focusing a window clears it again
+     * (meta_window_focus), which is how a pick hands the keyboard straight
+     * to the window picked; a cancel lets go here, back to the window that
+     * had it.
+     */
+    _syncKeyFocus() {
+        if (!this._keySink)
+            return;
+        const holding = global.stage.get_key_focus() === this._keySink;
+        const wanted = this._showingDesktop && this._isGridMode();
+        if (wanted && !holding)
+            global.stage.set_key_focus(this._keySink);
+        else if (!wanted && holding)
+            global.stage.set_key_focus(null);
     }
 
     /**
@@ -1794,6 +1870,7 @@ class ShowDesktopGesture {
         this._mode = null;
         for (const group of this._monitorGroups)
             group.setLayout('edge');
+        this._syncKeyFocus();
 
         const dur = duration ?? this._tunables.duration;
         let unparked = false;
@@ -1960,6 +2037,16 @@ class ShowDesktopGesture {
             // than after the animation keeps the whole pick one ordered
             // sequence instead of an animation racing a timer.
             win.activate(global.get_current_time());
+        }
+
+        // A pinch already dragging the grid home owns the clones, and
+        // restoreDesktop() leaves them to it. Released short, it would park
+        // them again under the mode cleared above and call the grid Show
+        // Desktop. Dismissing wins: cancelling sends them home now and leaves
+        // no gesture end to re-park them.
+        if (this._gestureActive) {
+            this._cancelActiveGesture(true);
+            return;
         }
 
         this.restoreDesktop(this._tunables.duration);
