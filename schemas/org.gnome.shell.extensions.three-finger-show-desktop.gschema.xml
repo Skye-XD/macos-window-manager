@@ -95,7 +95,7 @@
       <description>The fraction of the spread or pinch that has to be covered for releasing the fingers to complete it rather than put the windows back. Deliberately separate from the travel keys, so the motion can be slowed without also making it harder to commit to. Lower commits sooner.</description>
     </key>
     <key name="mission-control-toggle" type="as">
-      <default><![CDATA[['<Control><Super>Up']]]></default>
+      <default><![CDATA[['<Control>Up']]]></default>
       <summary>Show every window</summary>
       <description>Spread the windows of the current workspace out to be picked from, the way Mission Control does. macOS uses Control+Up for this.</description>
     </key>
