@@ -1371,6 +1371,10 @@ class ShowDesktopGesture {
             global.stage.disconnect(this._keyFocusId);
             this._keyFocusId = 0;
         }
+        if (this._retakeKeyFocusId) {
+            GLib.source_remove(this._retakeKeyFocusId);
+            this._retakeKeyFocusId = 0;
+        }
         this._keySink?.destroy();
         this._keySink = null;
         for (const id of this._displayHandlers)
@@ -1797,6 +1801,21 @@ class ShowDesktopGesture {
      * to the window picked; a cancel lets go here, back to the window that
      * had it.
      */
+    /**
+     * Focusing the fallback window of a closed one clears the stage key focus
+     * -- but meta_window_focus() does that after notify::focus-window, which
+     * is where this runs, so taking it back now would be undone at once.
+     */
+    _retakeKeyFocusLater() {
+        if (this._retakeKeyFocusId)
+            return;
+        this._retakeKeyFocusId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._retakeKeyFocusId = 0;
+            this._syncKeyFocus();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     _syncKeyFocus() {
         if (!this._keySink)
             return;
@@ -1936,9 +1955,7 @@ class ShowDesktopGesture {
             if (!settlingAfterClose)
                 this.hideSpread(focused);
             else
-                // Focusing the fallback window cleared the stage key focus
-                // (meta_window_focus): take it back while the grid stays.
-                this._syncKeyFocus();
+                this._retakeKeyFocusLater();
             return;
         }
 
