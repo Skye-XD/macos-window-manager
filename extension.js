@@ -1258,6 +1258,16 @@ class ShowDesktopGesture {
         // focus of an actor that is unmapped.
         this._keySink = new Clutter.Actor();
         Main.layoutManager.uiGroup.add_child(this._keySink);
+        // popModal() gives the key focus back to whatever held it when the
+        // modal opened. A grid dismissed under the overview or the Alt+Tab
+        // switcher therefore got the sink back with no grid up, and every key
+        // went nowhere. Let go whenever it lands here at the wrong time,
+        // whoever put it there.
+        this._keyFocusId = global.stage.connect('notify::key-focus', () => {
+            if (global.stage.get_key_focus() === this._keySink &&
+                !(this._showingDesktop && this._isGridMode()))
+                global.stage.set_key_focus(null);
+        });
 
         this._stageKeyId = global.stage.connect('captured-event::key', (_actor, event) => {
             if (!this._isGridMode() ||
@@ -1356,6 +1366,10 @@ class ShowDesktopGesture {
         if (this._stageKeyId) {
             global.stage.disconnect(this._stageKeyId);
             this._stageKeyId = 0;
+        }
+        if (this._keyFocusId) {
+            global.stage.disconnect(this._keyFocusId);
+            this._keyFocusId = 0;
         }
         this._keySink?.destroy();
         this._keySink = null;
@@ -1921,6 +1935,10 @@ class ShowDesktopGesture {
             // macOS does -- the focus moved on its own, nothing was picked.
             if (!settlingAfterClose)
                 this.hideSpread(focused);
+            else
+                // Focusing the fallback window cleared the stage key focus
+                // (meta_window_focus): take it back while the grid stays.
+                this._syncKeyFocus();
             return;
         }
 
