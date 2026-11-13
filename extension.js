@@ -174,6 +174,15 @@ function progressToUnit(progress) {
  */
 const TouchpadVerticalSwipe = GObject.registerClass(
     {
+        // A real property, as on the shell's own TouchpadSwipeGesture: the
+        // swipe tracker binds its 'enabled' to this, and a plain JS field gave
+        // "has no property called 'enabled'" on every enable and was never set.
+        Properties: {
+            'enabled': GObject.ParamSpec.boolean(
+                'enabled', null, null,
+                GObject.ParamFlags.READWRITE,
+                true),
+        },
         Signals: {
             begin: {
                 param_types: [
@@ -200,7 +209,6 @@ const TouchpadVerticalSwipe = GObject.registerClass(
             this._allowedModes = allowedModes;
             this._swipeDistance = primarySwipeDistance();
             this._state = TouchpadState.NONE;
-            this.enabled = true;
 
             this._stageHandler = global.stage.connect(
                 'captured-event::touchpad',
